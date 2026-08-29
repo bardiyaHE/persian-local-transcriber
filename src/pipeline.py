@@ -454,12 +454,15 @@ def main() -> None:
     parser.add_argument("--compute-type", required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--run-id", help="Optional safe run identifier supplied by the local UI.")
+    parser.add_argument("--profile", choices=["lite", "full"], default="full")
     parser.add_argument(
         "--adaptive-turbo", action="store_true",
         help=("Transcribe Turbo raw+enhanced first and run medium/large-v3 only "
               "on uncertain or medically sensitive intervals."),
     )
     args = parser.parse_args()
+    if args.profile == "lite":
+        args.adaptive_turbo = True
     root, audio = args.root.resolve(), args.audio.resolve()
     if not audio.is_file():
         raise FileNotFoundError(f"Audio file not found: {audio}")
@@ -503,6 +506,7 @@ def main() -> None:
         audio_sources = {"raw": normalized, "enhanced": enhanced}
         adaptive_plan: dict[str, Any] | None = None
         if args.adaptive_turbo:
+            secondary_model_order = [] if args.profile == "lite" else SECONDARY_MODEL_ORDER
             turbo_name = "large-v3-turbo"
             model_path = root / "models" / turbo_name
             load_started = time.perf_counter()
@@ -545,14 +549,14 @@ def main() -> None:
             adaptive_plan.update({
                 "enabled": True,
                 "turbo_hypotheses": ["large-v3-turbo__raw", "large-v3-turbo__enhanced"],
-                "secondary_models": SECONDARY_MODEL_ORDER,
+                "secondary_models": secondary_model_order,
                 "secondary_sources": SOURCE_ORDER,
                 "review_intervals": intervals,
             })
             (run_dir / "adaptive-turbo-plan.json").write_text(
                 json.dumps(adaptive_plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
-            for model_name in SECONDARY_MODEL_ORDER:
+            for model_name in secondary_model_order:
                 model_path = root / "models" / model_name
                 if not intervals:
                     for source in SOURCE_ORDER:
@@ -610,7 +614,8 @@ def main() -> None:
             if adaptive_work_root.exists():
                 shutil.rmtree(adaptive_work_root)
         else:
-            for model_name in MODEL_ORDER:
+            model_order = ["large-v3-turbo"] if args.profile == "lite" else MODEL_ORDER
+            for model_name in model_order:
                 model_path = root / "models" / model_name
                 load_started = time.perf_counter()
                 try:
@@ -658,6 +663,8 @@ def main() -> None:
             } for row in words_of(hypotheses[base_key])]
         else:
             base_key = "large-v3__enhanced"
+            if args.profile == "lite":
+                base_key = "large-v3-turbo__enhanced"
             final_text, decisions = merge(hypotheses)
         base_payload = hypotheses[base_key]
         large_payload = hypotheses.get("large-v3__enhanced") or base_payload
@@ -665,16 +672,22 @@ def main() -> None:
         turbo_dir = delivery / "01-whisper-large-v3-turbo"
         algo_dir = delivery / "02-after-algorithm"
         audio_dir = delivery / "03-denoised-audio"
-        for folder in (large_dir, turbo_dir, algo_dir, audio_dir): folder.mkdir(parents=True, exist_ok=True)
-        (large_dir / "large-v3.txt").write_text(large_payload["text"] + "\n", encoding="utf-8")
-        (large_dir / "large-v3.json").write_text(json.dumps(large_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        folders = [turbo_dir, algo_dir, audio_dir]
+        if args.profile == "full":
+            folders.insert(0, large_dir)
+        for folder in folders:
+            folder.mkdir(parents=True, exist_ok=True)
+        if args.profile == "full":
+            (large_dir / "large-v3.txt").write_text(large_payload["text"] + "\n", encoding="utf-8")
+            (large_dir / "large-v3.json").write_text(
+                json.dumps(large_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         (turbo_dir / "large-v3-turbo.txt").write_text(
             hypotheses["large-v3-turbo__enhanced"]["text"] + "\n", encoding="utf-8")
         (turbo_dir / "large-v3-turbo.json").write_text(
             json.dumps(hypotheses["large-v3-turbo__enhanced"], ensure_ascii=False, indent=2),
             encoding="utf-8")
         (algo_dir / "final.txt").write_text(final_text + "\n", encoding="utf-8")
-        final_json = {"base": base_key,
+        final_json = {"base": base_key, "profile": args.profile,
                       "method": ("adaptive Turbo-first before MiniLM V8" if args.adaptive_turbo
                                  else "timestamp consensus without LLM"),
                       "text": final_text, "decisions": decisions}
@@ -685,7 +698,7 @@ def main() -> None:
             "platform": platform.platform(), "python": sys.version, "processor": platform.processor(),
             "logical_cpu_threads": os.cpu_count(), "used_cpu_threads": args.threads,
             "device": args.device, "compute_type": args.compute_type,
-            "adaptive_turbo": args.adaptive_turbo,
+            "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
             "packages": {name: importlib.metadata.version(name) for name in
                          ["faster-whisper", "ctranslate2", "huggingface-hub", "numpy"]},
             "deepfilternet": "0.5.6 official x86_64-pc-windows-msvc binary",
@@ -716,7 +729,7 @@ def main() -> None:
             "| فرضیه | بارگذاری (ثانیه) | تبدیل (ثانیه) |", "|---|---:|---:|",
         ]
         report += [f"| {r['stage']} | {r['load_seconds']:.2f} | {r['processing_seconds']:.2f} |" for r in timings]
-        report += ["", "## شش فرضیه", ""]
+        report += ["", "## فرضیه‌های رونویسی", ""]
         for key, p in hypotheses.items(): report += [f"### {key}", "", p["text"], ""]
         if adaptive_plan:
             report += ["## برنامهٔ تطبیقی Turbo-first", "",
@@ -732,7 +745,7 @@ def main() -> None:
         summary = {"run_id": run_id, "run_dir": str(run_dir), "delivery": str(delivery),
                    "raw_metadata": raw_meta, "enhanced_metadata": enhanced_meta,
                    "timings": timings, "device": args.device, "compute_type": args.compute_type,
-                   "adaptive_turbo": args.adaptive_turbo,
+                   "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
                    "adaptive_turbo_plan": adaptive_plan,
                    "hypotheses": {k: v["text"] for k, v in hypotheses.items()},
                    "final_text": final_text}

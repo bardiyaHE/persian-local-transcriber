@@ -7,7 +7,14 @@ $App = Join-Path $Root 'src\web_app.py'
 $Log = Join-Path $Root 'outputs\web-ui.log'
 $Url = "http://127.0.0.1:$Port"
 if (-not (Test-Path -LiteralPath $Python)) { throw 'محیط محلی پیدا نشد؛ ابتدا setup.ps1 را اجرا کنید.' }
-& (Join-Path $Root 'start_local_qwen.ps1')
+$ProfileManifest = Join-Path $Root 'runtime\install-profile.json'
+if (-not (Test-Path -LiteralPath $ProfileManifest)) {
+    throw 'پروفایل نصب پیدا نشد؛ ابتدا setup.ps1 را اجرا کنید.'
+}
+$Profile = [string]((Get-Content -LiteralPath $ProfileManifest -Raw | ConvertFrom-Json).profile)
+if ($Profile -eq 'full') {
+    & (Join-Path $Root 'start_local_qwen.ps1')
+}
 $Running = $false
 try { $Running = (Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200 } catch { $Running = $false }
 if (-not $Running) {

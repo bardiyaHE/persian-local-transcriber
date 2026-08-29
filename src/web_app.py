@@ -28,6 +28,7 @@ MEDICAL_INDEX = ROOT / "offline-lexicon" / "combined-medical-drug-index.json"
 CORPUS_INDEX = ROOT / "offline-corpus" / "domain-ngrams-v1.sqlite3"
 ENCODER_DIR = ROOT / "models" / "semantic-encoder-v1"
 FINAL_RELATIVE = Path("final-delivery") / "02-after-algorithm-v2-turbo-lexicon"
+BASE_RELATIVE = Path("final-delivery") / "02-after-algorithm"
 SAFE_RELATIVE = Path("final-delivery") / "04-safe-no-llm"
 V3_RELATIVE = Path("final-delivery") / "02-after-algorithm-v3-phrase-network"
 V4_RELATIVE = Path("final-delivery") / "02-after-algorithm-v4-ngram-lexicon"
@@ -38,23 +39,39 @@ V9_RELATIVE = Path("final-delivery") / "09-medical-drug-dictionary"
 V10_RELATIVE = Path("final-delivery") / "10-local-qwen-reranker"
 V11_RELATIVE = Path("final-delivery") / "11-local-qwen-summary"
 GOOGLE_RECOGNITION_RELATIVE = Path("final-delivery") / "12-google-recognition-fallback"
-HYPOTHESES = [
+FULL_HYPOTHESES = [
     "medium__raw", "medium__enhanced", "large-v3-turbo__raw",
     "large-v3-turbo__enhanced", "large-v3__raw", "large-v3__enhanced",
 ]
+LITE_HYPOTHESES = ["large-v3-turbo__raw", "large-v3-turbo__enhanced"]
+
+
+def installation_profile() -> str:
+    manifest = ROOT / "runtime" / "install-profile.json"
+    if not manifest.is_file():
+        return "full"
+    try:
+        value = str(json.loads(manifest.read_text(encoding="utf-8-sig")).get("profile") or "")
+    except (OSError, ValueError, TypeError):
+        return "full"
+    return value if value in {"lite", "full"} else "full"
 
 
 def pipeline_status(run_dir: Path) -> str:
+    profile = installation_profile()
+    hypotheses = LITE_HYPOTHESES if profile == "lite" else FULL_HYPOTHESES
     if not run_dir.exists():
         return "در حال آماده‌سازی فایل…"
     if not (run_dir / "normalized_mono_48k.wav").exists():
         return "مرحله ۱ از ۱۴: تبدیل صوت با FFmpeg…"
     if not (run_dir / "enhanced_deepfilternet.wav").exists():
         return "مرحله ۲ از ۱۴: حذف نویز با DeepFilterNet…"
-    completed = sum((run_dir / "hypotheses" / key / f"{key}.json").exists() for key in HYPOTHESES)
-    if completed < 6:
+    completed = sum((run_dir / "hypotheses" / key / f"{key}.json").exists() for key in hypotheses)
+    if completed < len(hypotheses):
         return (f"مراحل ۳ تا ۸ از ۱۴: Turbo و بازبینی انتخابی — "
-                f"{completed} از ۶ فایل فرضیه آماده شده…")
+                f"{completed} از {len(hypotheses)} فایل فرضیه آماده شده…")
+    if profile == "lite":
+        return "مرحلهٔ نهایی Lite: آماده‌سازی متن Turbo و فایل‌های خروجی…"
     if not (run_dir / V9_RELATIVE / "final-v9.txt").exists():
         return "مراحل ۹ تا ۱۱ از ۱۴: قفل Turbo، MiniLM و بانک گسترش‌یافتهٔ داروهای فارسی…"
     if not (run_dir / V10_RELATIVE / "final-v10.txt").exists():
@@ -83,7 +100,8 @@ def history_choices() -> list[tuple[str, str]]:
                 or (run_dir / V4_RELATIVE / "final-v4.txt").is_file()
                 or (run_dir / V3_RELATIVE / "final-v3.txt").is_file()
                 or (run_dir / SAFE_RELATIVE / "safe-final.txt").is_file()
-                or (run_dir / FINAL_RELATIVE / "final-v2.txt").is_file()):
+                or (run_dir / FINAL_RELATIVE / "final-v2.txt").is_file()
+                or (run_dir / BASE_RELATIVE / "final.txt").is_file()):
             choices.append((run_dir.name.replace("ui-", ""), run_dir.name))
     return choices
 
@@ -335,6 +353,28 @@ def collect_result(run_dir: Path) -> tuple[str, str, str, list[str], dict]:
                    "backend": summary.get("backend"), "phrase_network_v3": summary}
         return final_text, baseline, review, downloads, details
 
+    base_path = run_dir / BASE_RELATIVE / "final.txt"
+    if base_path.is_file():
+        final_text = base_path.read_text(encoding="utf-8").strip()
+        report_path = run_dir / "report.md"
+        review = (report_path.read_text(encoding="utf-8") if report_path.is_file()
+                  else "حالت Lite بدون بازبینی معنایی و خلاصه‌ساز اجرا شده است.")
+        candidates = [
+            base_path,
+            run_dir / BASE_RELATIVE / "final.json",
+            report_path,
+            run_dir / "runtime-benchmark.json",
+            run_dir / "final-delivery" / "03-denoised-audio" / "enhanced.wav",
+            run_dir / f"{run_dir.name}-results.zip",
+        ]
+        details = {
+            "run_id": run_dir.name,
+            "output_folder": str(run_dir),
+            "backend": "whisper-large-v3-turbo",
+            "profile": "lite",
+        }
+        return final_text, final_text, review, [str(path) for path in candidates if path.is_file()], details
+
     safe_dir, final_dir = run_dir / SAFE_RELATIVE, run_dir / FINAL_RELATIVE
     safe_path = safe_dir / "safe-final.txt"
     if not safe_path.is_file():
@@ -532,6 +572,7 @@ def process_audio(audio_path: str | None):
     run_dir = ROOT / "outputs" / run_id
     ui_log = ROOT / "outputs" / f"{run_id}-ui.log"
     threads = os.cpu_count() or 4
+    profile = installation_profile()
     try:
         device, compute_type, backend_label = execution_backend()
     except Exception as exc:
@@ -542,12 +583,41 @@ def process_audio(audio_path: str | None):
         str(PYTHON), str(ROOT / "src" / "pipeline.py"),
         "--audio", str(source), "--root", str(ROOT),
         "--device", device, "--compute-type", compute_type, "--threads", str(threads),
-        "--run-id", run_id, "--adaptive-turbo",
+        "--run-id", run_id, "--adaptive-turbo", "--profile", profile,
     ]
     try:
         yield f"شروع پردازش محلی با {backend_label}…", "", "", "", "", empty_files, {"run_id": run_id}
         for status in run_command(pipeline_command, ui_log, run_dir):
             yield status, "", "", "", "", empty_files, {"run_id": run_id, "backend": backend_label}
+
+        if profile == "lite":
+            elapsed = time.perf_counter() - wall_started
+            run_summary = json.loads((run_dir / "run-summary.json").read_text(encoding="utf-8"))
+            audio_duration = float(
+                run_summary.get("raw_metadata", {}).get("format", {}).get("duration") or 0.0
+            )
+            benchmark = {
+                "run_id": run_id,
+                "profile": "lite",
+                "recorded_at_utc": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                "audio_duration_seconds": audio_duration,
+                "end_to_end_seconds": round(elapsed, 3),
+                "backend": backend_label,
+                "local_summary_available": False,
+                "external_api_used": False,
+            }
+            (run_dir / "runtime-benchmark.json").write_text(
+                json.dumps(benchmark, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            archive_base = run_dir / f"{run_id}-results"
+            shutil.make_archive(str(archive_base), "zip", root_dir=run_dir / "final-delivery")
+            lite_text, suggested, review, downloads, details = collect_result(run_dir)
+            details.update({"backend": backend_label, "profile": "lite"})
+            yield (
+                f"✅ پردازش Lite در {elapsed:.1f} ثانیه کامل شد؛ متن Turbo آماده است. "
+                "این پروفایل خلاصه‌ساز و بازبینی معنایی Full را نصب نمی‌کند."
+            ), lite_text, "خلاصه در پروفایل Lite موجود نیست.", suggested, review, downloads, details
+            return
 
         consensus_command = [
             str(PYTHON), str(ROOT / "src" / "consensus_v9_medical_drugs.py"),
@@ -683,35 +753,47 @@ textarea { direction: rtl !important; text-align: right !important; line-height:
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="رونویسی محلی گفتار فارسی") as demo:
-        gr.Markdown(
-            "# رونویسی فارسی محلی\n"
-            "فایل صوتی را آپلود یا ضبط کنید. Turbo خام و نویزگیری‌شده ابتدا متن پایه را می‌سازند؛ "
-            "مدل‌های دیگر فقط بازه‌های نامطمئن را بررسی می‌کنند و MiniLM و Qwen محلی همان نقاط را "
-            "با واژه‌نامه و پیکرهٔ فارسی پزشکی/روزمره رتبه‌بندی می‌کنند. Qwen فقط شناسهٔ "
-            "نامزدهای موجود را برای رونویسی انتخاب می‌کند؛ متن آزاد آن هرگز وارد متن رونویسی نمی‌شود. "
-            "پس از آن، Qwen 35B یک خلاصهٔ جدا می‌سازد که نام دارو، عدد، دوز و نفی آن دوباره با متن قفل می‌شود. "
-            "اگر متن محلی خالی یا آشکارا خراب باشد، Google Speech Recognition رایگان و بدون کلید "
-            "فقط همان فایل را به‌عنوان fallback امتحان می‌کند؛ در صورت محدودیت یا خطا، مسیر محلی حفظ می‌شود. "
-            "هر فایل مستقل است و هیچ ویس یا خروجی‌ای به پیکرهٔ ثابت اضافه نمی‌شود.",
-            elem_id="hero", rtl=True,
+    profile = installation_profile()
+    if profile == "lite":
+        intro = (
+            "# رونویسی فارسی محلی — Lite\n"
+            "فایل صوتی با FFmpeg نرمال و با DeepFilterNet نویزگیری می‌شود. "
+            "Whisper Large V3 Turbo روی نسخهٔ خام و نویزگیری‌شده اجرا می‌شود و متن Turbo تحویل می‌گردد. "
+            "این پروفایل برای دانلود و اجرای سبک‌تر است و Qwen، MiniLM، n-gram و خلاصه‌ساز Full را اجرا نمی‌کند."
         )
+        run_label = "شروع پردازش Lite"
+        transcript_label = "متن نهایی Lite (Whisper Large V3 Turbo)"
+        summary_label = "خلاصه (فقط در پروفایل Full موجود است)"
+    else:
+        intro = (
+            "# رونویسی فارسی محلی — Full\n"
+            "Turbo خام و نویزگیری‌شده ابتدا متن پایه را می‌سازند؛ مدل‌های دیگر فقط بازه‌های "
+            "نامطمئن را بررسی می‌کنند و MiniLM و Qwen محلی همان نقاط را با واژه‌نامه و "
+            "پیکرهٔ فارسی رتبه‌بندی می‌کنند. Qwen فقط نامزدهای مجاز را برای رونویسی انتخاب "
+            "می‌کند و سپس یک خلاصهٔ جدا می‌سازد. fallback آنلاین پیش‌فرض خاموش است و فقط "
+            "با متغیر محیطی مستندشده فعال می‌شود. هیچ فایل یا خروجی‌ای به پیکره اضافه نمی‌شود."
+        )
+        run_label = "شروع پردازش کامل"
+        transcript_label = "متن نهایی Full"
+        summary_label = "خلاصهٔ خودکار Full (جدا از متن و دارای قفل عدم‌حدس)"
+    with gr.Blocks(title="رونویسی محلی گفتار فارسی") as demo:
+        gr.Markdown(intro, elem_id="hero", rtl=True)
         with gr.Row():
             with gr.Column(scale=1):
                 audio = gr.File(type="filepath", file_count="single", file_types=None,
                                 label="فایل دارای صدا با هر پسوند یا قالب")
-                run_button = gr.Button("شروع پردازش کامل", variant="primary", size="lg")
+                run_button = gr.Button(run_label, variant="primary", size="lg")
                 gr.Markdown(
                     "پسوند فایل ملاک نیست؛ MP3، MPGA، WAV، M4A، FLAC، OGG، صوتِ داخل ویدئو و هر "
                     "قالبی که FFmpeg محلی بتواند باز کند، از روی محتوا تشخیص و خودکار به WAV تبدیل می‌شود. "
                     "پردازش روی این سیستم و به‌صورت صف یک‌تایی انجام می‌شود؛ صفحه را نبندید.", rtl=True)
             with gr.Column(scale=2):
                 status = gr.Markdown("آماده دریافت فایل", elem_id="status", rtl=True)
-                text_output = gr.Textbox(label="متن نهایی: V10 محلی یا Google Recognition فقط در fallback",
+                text_output = gr.Textbox(label=transcript_label,
                                          lines=10, max_lines=24, interactive=True, rtl=True,
                                          buttons=["copy"])
                 summary_output = gr.Textbox(
-                    label="خلاصهٔ پزشکی خودکار V11 (جدا از متن و دارای قفل عدم‌حدس)",
+                    label=summary_label,
                     lines=5, max_lines=12, interactive=True, rtl=True, buttons=["copy"])
                 with gr.Row():
                     name_input = gr.Textbox(

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "description": "Public terminology resources bundled for reproducible local setup",
+  "contains_runtime_user_data": false,
+  "files": [
+    {
+      "name": "combined-medical-drug-index.json",
+      "bytes": 19972230,
+      "sha256": "5417C998DC9641275810052657311CFB005CD473EE86AA7C8533670E336DFD47",
+      "license": "mixed: CC BY 4.0 and MIT; see SOURCES.md"
+    },
+    {
+      "name": "fa_modern_spoken_allowlist.txt",
+      "bytes": 204,
+      "sha256": "E1D817D4D1083ED0B10E65410E163DAD8E1A2AD34D4980A159D9BEEA768567A8",
+      "license": "project-maintained rule list"
+    },
+    {
+      "name": "fa_spoken_medical_concepts.txt",
+      "bytes": 756,
+      "sha256": "F23BD59523E26C340D7D0AD8E54A38E87FA643D93AA652A79EA5564CB6972F3A",
+      "license": "project-maintained rule list"
+    },
+    {
+      "name": "fa_user_blocklist.txt",
+      "bytes": 82,
+      "sha256": "AEC76B8AF9E59970A67F9C316A140236231A2AEE138100CCF46C1BF8D2197BF8",
+      "license": "project-maintained rule list"
+    },
+    {
+      "name": "SOURCES.md",
+      "bytes": 1575,
+      "sha256": "21761FD2A187339C48E30F111A9DEED7B63874D388C8AF7421AA488760C7A971",
+      "license": "documentation"
+    }
+  ]
+}

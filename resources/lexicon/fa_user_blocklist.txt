@@ -1,0 +1,2 @@
+# Tokens that may not win merely because they occur in a broad dictionary.
+خیل

@@ -1,0 +1,13 @@
+# Contemporary conversational Persian forms. One normalized token per line.
+واسه
+یه
+اومدیم
+نمیدونم
+میکرد
+میفرستم
+دندونه
+گفتن
+اونا
+کاراشو
+بچه
+حالا

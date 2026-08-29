@@ -43,6 +43,8 @@ def render_like(original: str, canonical: str) -> str:
 
 def load_overlay(name: str) -> set[str]:
     path = Path(__file__).resolve().parent.parent / "offline-lexicon" / name
+    if not path.is_file():
+        return set()
     return {norm(line) for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")}
 

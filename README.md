@@ -1,78 +1,88 @@
 # Persian Local Transcriber
 
-A local-first Persian speech-to-text pipeline with audio normalization, noise reduction, multi-pass Whisper transcription, deterministic consensus, constrained local-model review, and a separate summary.
+A local-first Persian speech-to-text application with two installation profiles:
 
-The repository contains source code only. It does not include audio recordings, transcripts, generated outputs, evaluation references, domain databases, model weights, caches, credentials, or logs.
+- **Lite:** Whisper Large V3 Turbo on raw and noise-reduced audio. It produces a transcript without installing the local language model.
+- **Full:** adaptive multi-model Whisper, deterministic consensus, public lexicon and local n-gram evidence, constrained Qwen reranking, and a separate local summary.
 
-## Highlights
+The repository contains code, documentation, and a licensed public terminology index. It contains no user recording, transcript, generated output, evaluation reference, patient record, runtime database, model weight, credential, cache, or log.
 
-- Accepts any audio container and codec supported by FFmpeg; the filename extension is not trusted.
-- Normalizes audio and applies DeepFilterNet before transcription.
-- Uses Whisper Large V3 Turbo as the base and selectively consults additional Whisper families on uncertain regions.
-- Ranks constrained alternatives with consensus, n-gram, lexical, and semantic signals.
-- Uses a local Qwen model for constrained reranking and a separate summary.
-- Provides a local Gradio interface and a PowerShell CLI.
-- Keeps the optional online speech fallback disabled by default.
+## Quick start on Windows
 
-## Privacy defaults
+Clone or download the repository, open PowerShell in its directory, and choose one profile.
 
-- Uploaded audio and all generated artifacts remain under the ignored `inputs/` and `outputs/` directories.
-- Model weights, locally built indexes, caches, and runtime binaries are ignored by Git.
-- No sample conversation or domain database is bundled.
-- Google Speech fallback is **off by default**. Enabling it can send selected audio chunks to Google and is not suitable for confidential recordings without the required consent and policy review.
+### Lite
 
-To explicitly enable that optional fallback for the current PowerShell session:
-
-```powershell
-$env:PERSIAN_TRANSCRIBER_GOOGLE_FALLBACK = '1'
-```
-
-## Requirements
-
-- Windows 10 or 11
-- PowerShell 7
-- Python 3.12
-- NVIDIA GPU recommended; CPU execution is supported but slower
-- Sufficient disk space for downloaded Whisper and Qwen model weights
-
-The setup downloads third-party runtimes and model weights into ignored local directories. Review the corresponding upstream licenses before redistribution or commercial use.
-
-## Quick start
+Smaller download and faster setup. Produces a Turbo transcript but no Full semantic review or local summary.
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-.\setup.ps1
+.\setup.ps1 -Profile Lite
 .\launch_ui.ps1
 ```
 
+### Full
+
+Downloads all required models and reproduces the complete local pipeline.
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup.ps1 -Profile Full
+.\launch_ui.ps1
+```
+
+Running `setup.ps1` again is safe. Completed files are reused, Hugging Face downloads resume from their local cache, checksums are verified, and only missing profile components are installed. A Lite installation can be upgraded by running `setup.ps1 -Profile Full`.
+
 The local interface opens at `http://127.0.0.1:7860`.
 
-Run a file directly:
+## What setup installs
+
+| Component | Lite | Full | Stored in Git |
+|---|---:|---:|---:|
+| FFmpeg and DeepFilterNet | yes | yes | no |
+| Whisper Large V3 Turbo | yes | yes | no |
+| Whisper Medium and Large V3 | no | yes | no |
+| MiniLM semantic encoder | no | yes | no |
+| Qwen 35B-A3B and llama.cpp | no | yes | no |
+| Licensed public terminology index | no | yes | yes |
+| Runtime n-gram SQLite database | no | built locally | no |
+
+Lite requires roughly 2–3 GB after dependencies. Full requires roughly 26 GB for model weights plus installation headroom. Exact usage varies with GPU runtime packages and caches.
+
+## Command line
+
+The installed profile is selected automatically:
 
 ```powershell
 .\run_pipeline.ps1 -AudioFile 'C:\path\to\audio-file'
 ```
 
-## Pipeline
+A Full installation can explicitly run the lighter path:
 
-1. Detect and decode the real audio stream with FFmpeg.
-2. Normalize to mono PCM and create a DeepFilterNet-enhanced copy.
-3. Generate Turbo hypotheses from raw and enhanced audio.
-4. Run additional Whisper models only over uncertain intervals.
-5. Apply deterministic consensus and locally built lexical/semantic indexes.
-6. Let the local model choose only among allowed candidates.
-7. Build a separate summary and validate sensitive names, numbers, doses, and negation against source hypotheses.
-8. Return the transcript, summary, confidence information, and review artifacts.
+```powershell
+.\run_pipeline.ps1 -AudioFile 'C:\path\to\audio-file' -Profile lite
+```
 
-## Repository layout
+## Privacy defaults
 
-- `src/pipeline.py`: audio preparation and Whisper inference
-- `src/consensus_v*.py`: deterministic and semantic consensus stages
-- `src/local_qwen_reranker_v10.py`: constrained local reranking
-- `src/local_qwen_summarizer_v11.py`: separate evidence-checked summary
-- `src/web_app.py`: local Gradio interface
-- `setup.ps1`: local dependency and model setup
-- `run_pipeline.ps1`: command-line entry point
+- Runtime audio and results are written only to ignored `inputs/` and `outputs/` directories.
+- Models, generated indexes, caches, binaries, and environment files are ignored by Git.
+- Google Speech fallback is **disabled by default**.
+- Enabling the optional fallback can send selected audio chunks to Google. Do not enable it for confidential recordings without the required consent and policy review.
+
+To explicitly enable it for the current PowerShell session:
+
+```powershell
+$env:PERSIAN_TRANSCRIBER_GOOGLE_FALLBACK = '1'
+```
+
+## Documentation
+
+- [Installation and troubleshooting](docs/INSTALLATION.md)
+- [Architecture and profile behavior](docs/ARCHITECTURE.md)
+- [Model and runtime sources](docs/MODELS.md)
+- [Lexicon sources and licenses](resources/lexicon/SOURCES.md)
+- [Privacy policy](PRIVACY.md)
 
 ## Safety and limitations
 

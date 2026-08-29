@@ -231,15 +231,18 @@ def wikipedia_rows(raw_path: Path, local_only: bool) -> Iterator[tuple[str, str,
             yield "fa_wikipedia_medical", sentence, 2
 
 
-def all_rows(raw_path: Path, local_only: bool) -> Iterable[tuple[str, str, str, int]]:
-    for source, text, weight in persianmedqa_rows(local_only):
-        yield "medical", source, text, weight
+def all_rows(raw_path: Path, local_only: bool,
+             public_only: bool) -> Iterable[tuple[str, str, str, int]]:
+    if not public_only:
+        for source, text, weight in persianmedqa_rows(local_only):
+            yield "medical", source, text, weight
     for source, text, weight in wikipedia_rows(raw_path, local_only):
         yield "medical", source, text, weight
     for source, text, weight in common_voice_rows(local_only):
         yield "daily", source, text, weight
-    for source, text, weight in psydial_rows(local_only):
-        yield "daily", source, text, weight
+    if not public_only:
+        for source, text, weight in psydial_rows(local_only):
+            yield "daily", source, text, weight
 
 
 def write_sources(path: Path, stats: dict[str, dict[str, int]], created_at: str) -> None:
@@ -299,7 +302,8 @@ def validate_existing(database: Path) -> dict[str, object]:
         connection.close()
 
 
-def build(output_dir: Path, local_only: bool, rebuild: bool) -> dict[str, object]:
+def build(output_dir: Path, local_only: bool, rebuild: bool,
+          public_only: bool) -> dict[str, object]:
     output_dir.mkdir(parents=True, exist_ok=True)
     database = output_dir / "domain-ngrams-v1.sqlite3"
     if database.is_file() and not rebuild:
@@ -321,7 +325,7 @@ def build(output_dir: Path, local_only: bool, rebuild: bool) -> dict[str, object
     seen: set[bytes] = set()
     with gzip.open(corpus_path, "wt", encoding="utf-8") as corpus:
         for domain, source, text, weight in all_rows(
-                output_dir / "raw" / "wikipedia-medical.json", local_only):
+                output_dir / "raw" / "wikipedia-medical.json", local_only, public_only):
             tokens = tokens_of(text)
             if not (2 <= len(tokens) <= 160):
                 continue
@@ -341,8 +345,16 @@ def build(output_dir: Path, local_only: bool, rebuild: bool) -> dict[str, object
                 for index in range(len(tokens) - size + 1):
                     counters[domain][size][tuple(tokens[index:index + size])] += weight
 
-    if not stats.get("persianmedqa") or not stats.get("common_voice_fa_clean"):
-        raise RuntimeError("Required medical or daily Persian source produced no usable text.")
+    required_sources = (
+        ("fa_wikipedia_medical", "common_voice_fa_clean")
+        if public_only else ("persianmedqa", "common_voice_fa_clean")
+    )
+    missing_sources = [source for source in required_sources if not stats.get(source)]
+    if missing_sources:
+        raise RuntimeError(
+            "Required Persian corpus sources produced no usable text: "
+            + ", ".join(missing_sources)
+        )
 
     temporary = database.with_suffix(".building.sqlite3")
     if temporary.exists():
@@ -383,6 +395,7 @@ def build(output_dir: Path, local_only: bool, rebuild: bool) -> dict[str, object
             "algorithm": "weighted exact Persian unigram/bigram/trigram with FTS5 context retrieval",
             "translation_used": "false",
             "llm_used": "false",
+            "public_only": str(public_only).lower(),
             "source_manifest": json.dumps(SOURCES, ensure_ascii=False),
             "source_stats": json.dumps(stats, ensure_ascii=False),
         }
@@ -448,8 +461,14 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "offline-corpus")
     parser.add_argument("--local-only", action="store_true")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--public-only", action="store_true",
+        help="Build only from Persian Wikipedia and the public Common Voice text manifest.",
+    )
     args = parser.parse_args()
-    result = build(args.output_dir.resolve(), args.local_only, args.rebuild)
+    result = build(
+        args.output_dir.resolve(), args.local_only, args.rebuild, args.public_only
+    )
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
