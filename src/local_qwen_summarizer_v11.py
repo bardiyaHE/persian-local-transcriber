@@ -32,7 +32,7 @@ from local_qwen_reranker_v10 import (
 V9_RELATIVE = Path("final-delivery") / "09-medical-drug-dictionary"
 V10_RELATIVE = Path("final-delivery") / "10-local-qwen-reranker"
 OUTPUT_RELATIVE = Path("final-delivery") / "11-local-qwen-summary"
-PROMPT_VERSION = "v11-fa-medical-summary-consensus-evidence-google-drug-23"
+PROMPT_VERSION = "v11-fa-medical-summary-consensus-evidence-google-drug-24"
 SPOKEN_CONCEPTS_FILENAME = "fa_spoken_medical_concepts.txt"
 SAFE_FALLBACK = (
     "خلاصهٔ خودکار به‌دلیل ابهام متن یا خطای اعتبارسنجی قابل‌اعتماد نبود؛ "
@@ -410,10 +410,30 @@ def unsupported_temporal_terms(summary: str, evidence: str) -> list[str]:
         - set(tokens_of(evidence)).intersection(TEMPORAL_TOKENS))
 
 
+def colloquial_possessive_variants(token: str) -> set[str]:
+    normalized = v4.norm(token)
+    variants = {normalized}
+    for suffix in ("تون", "تان", "مون", "مان", "شون", "شان"):
+        if normalized.endswith(suffix) and len(normalized) > len(suffix) + 1:
+            variants.add(normalized[:-len(suffix)])
+    return variants
+
+
+def fuzzy_token_supported(token: str, evidence_tokens: list[str]) -> bool:
+    return any(
+        v4.token_similarity(left, right) >= 0.72
+        for candidate in evidence_tokens
+        for left in colloquial_possessive_variants(token)
+        for right in colloquial_possessive_variants(candidate)
+    )
+
+
 def unsupported_institution_terms(summary: str, evidence: str) -> list[str]:
+    evidence_tokens = tokens_of(evidence)
     return sorted(
-        set(tokens_of(summary)).intersection(INSTITUTION_TOKENS)
-        - set(tokens_of(evidence)).intersection(INSTITUTION_TOKENS))
+        token for token in set(tokens_of(summary)).intersection(INSTITUTION_TOKENS)
+        if not fuzzy_token_supported(token, evidence_tokens)
+    )
 
 
 def hypothesis_is_degenerate(text: str) -> bool:
@@ -433,17 +453,116 @@ def hypothesis_is_degenerate(text: str) -> bool:
     return longest_run >= 8
 
 
+def hypothesis_words(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    words: list[dict[str, Any]] = []
+    for segment in payload.get("segments") or []:
+        for item in segment.get("words") or []:
+            text = normalize_text(item.get("word") or "")
+            if text:
+                words.append({
+                    "word": text,
+                    "start": float(item.get("start", segment.get("start", 0.0))),
+                    "end": float(item.get("end", segment.get("end", 0.0))),
+                })
+    return words
+
+
+def trim_stitch_overlap(text: str, left_context: str, right_context: str) -> str:
+    candidate = normalize_text(text).split()
+    left = normalize_text(left_context).split()
+    right = normalize_text(right_context).split()
+    for width in range(min(3, len(candidate), len(left)), 0, -1):
+        if [v4.norm(token) for token in candidate[:width]] == [
+                v4.norm(token) for token in left[-width:]]:
+            candidate = candidate[width:]
+            break
+    for width in range(min(3, len(candidate), len(right)), 0, -1):
+        if [v4.norm(token) for token in candidate[-width:]] == [
+                v4.norm(token) for token in right[:width]]:
+            candidate = candidate[:-width]
+            break
+    return normalize_text(" ".join(candidate))
+
+
+def reconstruct_selective_hypothesis(payload: dict[str, Any],
+                                     adaptive_plan: dict[str, Any]) -> str:
+    audit = sorted(
+        adaptive_plan.get("segment_audit") or [],
+        key=lambda row: float(row.get("start") or 0.0),
+    )
+    if not audit:
+        return ""
+    words = hypothesis_words(payload)
+    stitched: list[str] = []
+    for index, segment in enumerate(audit):
+        turbo_text = normalize_text(segment.get("text") or "")
+        if not segment.get("needs_secondary_asr"):
+            if turbo_text:
+                stitched.append(turbo_text)
+            continue
+        start = float(segment.get("start") or 0.0)
+        end = float(segment.get("end") or start)
+        selected = [
+            str(word["word"]) for word in words
+            if start <= (float(word["start"]) + float(word["end"])) / 2.0 <= end
+        ]
+        previous_stable = stitched[-1] if stitched else ""
+        next_stable = ""
+        for following in audit[index + 1:]:
+            if not following.get("needs_secondary_asr"):
+                next_stable = normalize_text(following.get("text") or "")
+                break
+        reviewed_text = trim_stitch_overlap(
+            " ".join(selected), previous_stable, next_stable)
+        stitched.append(reviewed_text or turbo_text)
+    return normalize_text(" ".join(stitched))
+
+
 def load_hypothesis_evidence(run_dir: Path) -> dict[str, str]:
     hypotheses: dict[str, str] = {}
     root = run_dir / "hypotheses"
     if not root.is_dir():
         return hypotheses
-    for path in sorted(root.glob("*/*.txt")):
-        text = normalize_text(path.read_text(encoding="utf-8-sig"))
+    plan_path = run_dir / "adaptive-turbo-plan.json"
+    adaptive_plan = load_json(plan_path) if plan_path.is_file() else {}
+    for path in sorted(root.glob("*/*.json")):
+        payload = load_json(path)
+        text = normalize_text(payload.get("text") or "")
+        if payload.get("selective_secondary_asr"):
+            text = reconstruct_selective_hypothesis(payload, adaptive_plan) or text
         if not text or hypothesis_is_degenerate(text):
             continue
         hypotheses[path.stem] = text
     return hypotheses
+
+
+def load_hypothesis_coverage(run_dir: Path) -> dict[str, dict[str, Any]]:
+    coverage: dict[str, dict[str, Any]] = {}
+    root = run_dir / "hypotheses"
+    if not root.is_dir():
+        return coverage
+    for path in sorted(root.glob("*/*.json")):
+        try:
+            payload = load_json(path)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        selective = bool(payload.get("selective_secondary_asr"))
+        intervals = [
+            {
+                "start": round(float(row.get("start") or 0.0), 3),
+                "end": round(float(row.get("end") or 0.0), 3),
+            }
+            for row in payload.get("selective_intervals") or []
+        ]
+        coverage[path.stem] = {
+            "scope": "reconstructed-full-audio" if selective else "full-audio",
+            "observed_scope": "reviewed-intervals-only" if selective else "full-audio",
+            "selective_secondary_asr": selective,
+            "stable_turbo_spans_inserted": selective,
+            "intervals": intervals,
+            "observed_text": normalize_text(payload.get("text") or "") if selective else "",
+        }
+    return coverage
 
 
 def combined_evidence(source_text: str, hypotheses: dict[str, str] | None = None) -> str:
@@ -566,6 +685,36 @@ def asr_family_agreement(hypotheses: dict[str, str]) -> float | None:
             if denominator:
                 scores.append(len(left.intersection(right)) / denominator)
     return round(sum(scores) / len(scores), 4) if scores else None
+
+
+def active_status_subjects(text: str) -> set[str]:
+    """Extract the closest lexical subject of an explicit «active» status."""
+    tokens = tokens_of(text)
+    ignored = {
+        "و", "که", "اگر", "این", "آن", "اون", "هم", "برای", "شما", "من",
+        "هست", "است", "بود", "باشد", "بوده",
+    }
+    subjects: set[str] = set()
+    for index, token in enumerate(tokens):
+        if not token.startswith("فعال"):
+            continue
+        for previous in reversed(tokens[max(0, index - 3):index]):
+            if previous not in ignored and len(previous) >= 2:
+                subjects.add(previous)
+                break
+    return subjects
+
+
+def unsupported_active_status_subjects(summary: str, evidence: str) -> list[str]:
+    generated = active_status_subjects(summary)
+    heard = active_status_subjects(evidence)
+    if not generated or not heard:
+        return []
+
+    return sorted(
+        subject for subject in generated
+        if not fuzzy_token_supported(subject, list(heard))
+    )
 
 
 def source_quality_metrics(source_text: str, hypotheses: dict[str, str] | None = None) \
@@ -903,7 +1052,8 @@ def uncertainty_notes(source_text: str, v9: dict[str, Any]) -> list[str]:
 def build_prompt(source_text: str, v9: dict[str, Any],
                  hypotheses: dict[str, str] | None = None,
                  role_hints: list[dict[str, str]] | None = None,
-                 concept_hints: list[dict[str, Any]] | None = None) -> str:
+                 concept_hints: list[dict[str, Any]] | None = None,
+                 hypothesis_coverage: dict[str, dict[str, Any]] | None = None) -> str:
     approved_drugs = approved_dictionary_evidence(v9)
     notes = uncertainty_notes(source_text, v9)
     lines = [
@@ -936,8 +1086,12 @@ def build_prompt(source_text: str, v9: dict[str, Any],
         "هرگز «توصیه می‌کنم» نیست.",
         "هر دارو یا روش را فقط به نزدیک‌ترین فعل خودش وصل کن و دو اقدام را ادغام نکن؛ مثلاً اگر دوز "
         "باید ادامه یابد ولی فیلر فقط بلامانع است، ننویس «دوز و فیلر ادامه یابد».",
-        "7) متن پایه قبلاً از مقایسهٔ شش رونویسی ساخته شده است. راهنماهای زیر نیز فقط وقتی افزوده شده‌اند "
-        "که شواهد مستقل کافی داشته‌اند؛ عبارت پرت یک مدل را وارد خلاصه نکن.",
+        "7) متن پایه قبلاً از مقایسهٔ چند رونویسی ساخته شده است. بعضی مدل‌های ثانویه ممکن است فقط "
+        "بازهٔ نامطمئن را شنیده باشند. نبودن ابتدای یا انتهای جمله در یک رونویسیِ جزئی هرگز به معنی "
+        "حذف آن محتوا، مخالفت مدل یا شنیده‌نشدن آن در صوت نیست. بخش پایدار Turbo را به دلیل کوتاه‌تر "
+        "بودن متن Medium/Large حذف نکن. راهنماهای زیر فقط با شواهد مثبت استفاده شوند.",
+        "فاعل وضعیت‌هایی مانند «فعال است» را عوض نکن. اسم چیزی که فعال است باید از شواهد "
+        "شنیده‌شده پشتیبانی شود و حق جایگزینی آن با موجودیت دیگری را نداری.",
         "8) احوال‌پرسی، تکیه‌کلام و بخش بی‌معنا را حذف کن. بخش نامفهوم را حدس نزن.",
         "عبارت‌های بی‌معنا یا کم‌اجماع مانند ترکیب تصادفیِ عدد، واحد و واژهٔ عمومی را حتی اگر در متن پایه "
         "مانده‌اند وارد خلاصه نکن. از متن خراب، دستور قطعی پزشک نساز.",
@@ -977,6 +1131,24 @@ def build_prompt(source_text: str, v9: dict[str, Any],
             lines.append(
                 "روش‌های بررسی/تصویربرداریِ شنیده‌شده که نباید به نوع دیگری تبدیل شوند: "
                 + "، ".join(surfaces) + ".")
+        partial_coverage = {
+            name: row for name, row in (hypothesis_coverage or {}).items()
+            if row.get("selective_secondary_asr")
+        }
+        if partial_coverage:
+            lines.append(
+                "محدودهٔ واقعی مدل‌های ثانویهٔ جزئی؛ متن این مدل‌ها فقط دربارهٔ همین بازه‌هاست و "
+                "خارج از آن‌ها هیچ شاهد منفی ایجاد نمی‌کند:")
+            for name, row in sorted(partial_coverage.items()):
+                intervals = "، ".join(
+                    f"{interval['start']:.2f}–{interval['end']:.2f}s"
+                    for interval in row.get("intervals") or []) or "بازهٔ بازبینی"
+                heard = normalize_text(row.get("observed_text") or "")
+                if len(heard) > 240:
+                    heard = heard[:237].rstrip() + "…"
+                lines.append(
+                    f"- {name}: اصل مدل فقط {intervals} را شنیده؛ بخش‌های پایدار Turbo به متن "
+                    f"مقایسه‌ای آن اضافه شده‌اند. متن شنیده‌شدهٔ همان بازه: «{heard}»")
     if approved_drugs:
         lines.append("نام‌های دارویی تأییدشدهٔ واژه‌نامه در همین اجرا: " + "، ".join(approved_drugs))
     if notes:
@@ -1132,6 +1304,7 @@ def validate_generated(generated: dict[str, Any], source_text: str, v9: dict[str
     unsupported_institutions = unsupported_institution_terms(summary, evidence)
     unsupported_availability = unsupported_drug_availability_conditions(
         summary, evidence, drug_phrases)
+    unsupported_active_subjects = unsupported_active_status_subjects(summary, evidence)
 
     source_drugs = matched_phrases(evidence, drug_phrases)
     generated_drugs = matched_phrases(combined, drug_phrases)
@@ -1213,6 +1386,8 @@ def validate_generated(generated: dict[str, Any], source_text: str, v9: dict[str
         errors.append("unsupported-institution")
     if unsupported_availability:
         errors.append("unsupported-drug-availability-condition")
+    if unsupported_active_subjects:
+        errors.append("unsupported-active-status-subject")
     return {
         "valid": not errors,
         "errors": errors,
@@ -1243,6 +1418,7 @@ def validate_generated(generated: dict[str, Any], source_text: str, v9: dict[str
             "temporal_terms": unsupported_temporal,
             "institutions": unsupported_institutions,
             "drug_availability_conditions": unsupported_availability,
+            "active_status_subjects": unsupported_active_subjects,
         },
         "source_drugs": sorted(source_drugs),
         "generated_drugs": sorted(generated_drugs),
@@ -1963,6 +2139,8 @@ def neutralize_ambiguous_speaker_advice(generated: dict[str, Any],
              "در پیام گفته شده است که"),
             (re.compile(r"پزشک\s+درخواست\s+کرده\s+است\s+که"),
              "در پیام درخواست شده است که"),
+            (re.compile(r"(?<!\w)(?:پزشک|دکتر)(?!\w)"),
+             "گوینده"),
         ])
     original = cleaned["summary"]
     for pattern, replacement in substitutions:
@@ -2603,6 +2781,7 @@ def run(run_dir: Path, medical_index: Path, server_url: str, timeout: float,
     v9_path = run_dir / V9_RELATIVE / "final-v9.json"
     v9 = (load_json(v9_path) if v9_path.is_file() else {}) if not external_primary else {}
     hypotheses = load_hypothesis_evidence(run_dir) if not external_primary else {}
+    hypothesis_coverage = load_hypothesis_coverage(run_dir) if not external_primary else {}
     evidence_text = combined_evidence(source_text, hypotheses)
     drug_phrases = load_drug_phrases(medical_index)
     disease_phrases = load_disease_phrases(medical_index)
@@ -2658,10 +2837,16 @@ def run(run_dir: Path, medical_index: Path, server_url: str, timeout: float,
             else:
                 generated, model_call = call_local_qwen(
                     server_url,
-                    build_prompt(source_text, v9, hypotheses, role_hints, concept_hints),
+                    build_prompt(
+                        source_text, v9, hypotheses, role_hints, concept_hints,
+                        hypothesis_coverage),
                     timeout)
                 model_call["asr_alternative_count"] = len(hypotheses)
                 model_call["two_family_concept_hint_count"] = len(concept_hints)
+                model_call["partial_asr_alternative_count"] = sum(
+                    bool(row.get("selective_secondary_asr"))
+                    for row in hypothesis_coverage.values())
+                model_call["hypothesis_coverage"] = hypothesis_coverage
             model_call["source_quality"] = source_quality_metrics(source_text, hypotheses)
             raw_generated = dict(generated)
             generated, validation = ground_generated(

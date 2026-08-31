@@ -20,10 +20,11 @@ Lite is a useful transcript-only application, not a placeholder installer.
 1. Turbo processes the complete raw and enhanced audio.
 2. Uncertain intervals are identified from word confidence and raw/enhanced disagreement.
 3. Whisper Medium and Large V3 inspect only those intervals.
-4. Deterministic consensus combines acoustic-family support, lexical evidence, n-gram context, and MiniLM similarity.
-5. Qwen may choose only among candidates already admitted by the constrained lattice; its free-form text cannot enter the transcript.
-6. A separate Qwen pass creates a summary.
-7. Post-validation checks names, numbers, doses, negation, and unsupported additions against the transcription evidence.
+4. For comparison, stable Turbo spans are inserted around each selective Medium/Large result. This reconstructs six full-text views without pretending that the inserted spans are four additional acoustic votes.
+5. Deterministic consensus combines acoustic-family support, lexical evidence, n-gram context, and MiniLM similarity.
+6. Qwen sees all six full-text views for context, but it may choose only candidates inside the uncertain intervals. Stable Turbo spans are locked, and a final coverage guard rejects any accidental deletion.
+7. A separate Qwen pass creates a summary from the full reconstructed evidence and retains coverage metadata for every partial ASR source.
+8. Post-validation checks names, numbers, doses, negation, speaker roles, entity subjects, and unsupported additions against the transcription evidence.
 
 ## Data boundaries
 

@@ -109,16 +109,104 @@ def flatten_words(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return words
 
 
+def stitch_selective_hypothesis(payload: dict[str, Any],
+                                adaptive_plan: dict[str, Any]) -> str:
+    """Insert stable Turbo spans around words heard by a selective model."""
+    audit = sorted(
+        adaptive_plan.get("segment_audit") or [],
+        key=lambda row: float(row.get("start") or 0.0),
+    )
+    if not audit:
+        return ""
+    words = payload.get("words") or []
+    stitched: list[str] = []
+    for index, segment in enumerate(audit):
+        turbo_text = normalize_text(segment.get("text") or "")
+        if not segment.get("needs_secondary_asr"):
+            if turbo_text:
+                stitched.append(turbo_text)
+            continue
+        start = float(segment.get("start") or 0.0)
+        end = float(segment.get("end") or start)
+        selected = []
+        for word in words:
+            midpoint = (float(word["start"]) + float(word["end"])) / 2.0
+            if start <= midpoint <= end:
+                selected.append(str(word["word"]))
+        previous_stable = stitched[-1] if stitched else ""
+        next_stable = ""
+        for following in audit[index + 1:]:
+            if not following.get("needs_secondary_asr"):
+                next_stable = normalize_text(following.get("text") or "")
+                break
+        reviewed_text = trim_boundary_overlap(
+            " ".join(selected), previous_stable, next_stable)
+        # A secondary model may emit nothing for a reviewed silence.  Retain
+        # the Turbo segment instead of turning missing coverage into deletion.
+        stitched.append(reviewed_text or turbo_text)
+    return normalize_text(" ".join(stitched))
+
+
 def load_hypotheses(run_dir: Path) -> dict[str, dict[str, Any]]:
     loaded: dict[str, dict[str, Any]] = {}
+    plan_path = run_dir / "adaptive-turbo-plan.json"
+    adaptive_plan = load_json(plan_path) if plan_path.is_file() else {}
+    editable_intervals = [
+        {
+            "start": float(segment.get("start") or 0.0),
+            "end": float(segment.get("end") or 0.0),
+        }
+        for segment in adaptive_plan.get("segment_audit") or []
+        if segment.get("needs_secondary_asr")
+    ]
     for key in HYPOTHESES:
         payload = load_json(hypothesis_json_path(run_dir, key))
-        loaded[key] = {
+        row = {
             "text": normalize_text(payload.get("text") or ""),
             "duration": float(payload.get("duration") or 0.0),
             "words": flatten_words(payload),
+            "selective_secondary_asr": bool(payload.get("selective_secondary_asr")),
+            "coverage_intervals": list(payload.get("selective_intervals") or []),
+            "adaptive_editable_intervals": editable_intervals,
         }
+        row["observed_text"] = row["text"]
+        if row["selective_secondary_asr"]:
+            stitched = stitch_selective_hypothesis(row, adaptive_plan)
+            if stitched:
+                row["text"] = stitched
+                row["comparison_text_reconstructed"] = True
+        loaded[key] = row
     return loaded
+
+
+def adaptive_editable_intervals(
+        hypotheses: dict[str, dict[str, Any]]) -> list[dict[str, float]]:
+    for payload in hypotheses.values():
+        intervals = payload.get("adaptive_editable_intervals") or []
+        if intervals:
+            return [
+                {"start": float(row["start"]), "end": float(row["end"])}
+                for row in intervals
+            ]
+    return []
+
+
+def slot_in_intervals(row: dict[str, Any], intervals: list[dict[str, float]]) -> bool:
+    if not intervals:
+        return True
+    start = float(row.get("start") or 0.0)
+    end = float(row.get("end") or start)
+    midpoint = (start + end) / 2.0
+    # Word alignments may straddle the adaptive boundary slightly.  Permit a
+    # small timestamp wobble, but do not pull the final stable Turbo word into
+    # the editable range merely because its long alignment crosses the cut.
+    boundary_tolerance = 0.20
+    return any(
+        interval["start"] <= midpoint <= interval["end"]
+        and start >= interval["start"] - boundary_tolerance
+        and end <= interval["end"] + boundary_tolerance
+        for interval in intervals
+    )
 
 
 def tokens_of(text: str) -> list[str]:
@@ -825,6 +913,10 @@ def region_candidates(hypotheses: dict[str, dict[str, Any]], base_text: str,
     add(base_text, "v9")
     for key, payload in hypotheses.items():
         if full_audio:
+            # A selective Medium/Large pass contains only the reviewed time
+            # ranges.  Its shorter text is not a full-utterance alternative.
+            if payload.get("selective_secondary_asr"):
+                continue
             add(payload["text"], key)
             continue
         selected = []
@@ -844,10 +936,21 @@ def make_regions(slots: list[dict[str, Any]], hypotheses: dict[str, dict[str, An
     if not slots:
         return []
     duration = max(payload["duration"] for payload in hypotheses.values())
-    uncertain = [index for index, row in enumerate(slots) if slot_is_uncertain(row)]
+    editable_intervals = adaptive_editable_intervals(hypotheses)
+    uncertain = [
+        index for index, row in enumerate(slots)
+        if slot_is_uncertain(row) and slot_in_intervals(row, editable_intervals)
+    ]
     # Short messages benefit from one coherent utterance-level decision. This rule
     # is based only on duration, never on a filename, reference transcript or voice.
-    full_audio = duration <= 25.0 and bool(uncertain)
+    has_partial_hypotheses = any(
+        bool(payload.get("selective_secondary_asr"))
+        for payload in hypotheses.values()
+    )
+    # Whole-utterance reranking is safe only when every candidate actually
+    # covered the whole utterance.  Adaptive secondary models deliberately do
+    # not hear stable Turbo spans, so their omission is not disagreement.
+    full_audio = duration <= 25.0 and bool(uncertain) and not has_partial_hypotheses
     if full_audio:
         ranges = [(0, len(slots) - 1)]
     else:
@@ -867,6 +970,14 @@ def make_regions(slots: list[dict[str, Any]], hypotheses: dict[str, dict[str, An
             start = max(0, cluster[0] - 2)
             end = min(len(slots) - 1, cluster[-1] + 2)
             start, end = expand_for_placeholders(start, end, placeholders)
+            if editable_intervals:
+                editable_slots = [
+                    index for index in range(start, end + 1)
+                    if slot_in_intervals(slots[index], editable_intervals)
+                ]
+                if not editable_slots:
+                    continue
+                start, end = min(editable_slots), max(editable_slots)
             if ranges and start <= ranges[-1][1] + 1:
                 ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
             else:
@@ -909,7 +1020,9 @@ def make_regions(slots: list[dict[str, Any]], hypotheses: dict[str, dict[str, An
     return regions
 
 
-def build_prompt(regions: list[dict[str, Any]]) -> tuple[str, dict[str, dict[str, Any]]]:
+def build_prompt(regions: list[dict[str, Any]],
+                 hypotheses: dict[str, dict[str, Any]] | None = None
+                 ) -> tuple[str, dict[str, dict[str, Any]]]:
     lines = [
         "از میان رونویسی‌های یک مکالمه پزشکی فارسی، برای هر بخش نزدیک‌ترین گزینه به گفتار طبیعی و معنادار را انتخاب کن.",
         "فقط شناسه گزینه را بده؛ کلمه تازه نساز، گزینه‌ها را ترکیب نکن و بازنویسی نکن.",
@@ -920,6 +1033,18 @@ def build_prompt(regions: list[dict[str, Any]]) -> tuple[str, dict[str, dict[str
         "U فقط وقتی مجاز است که همه گزینه‌ها واقعاً نامفهوم باشند و هیچ‌کدام برتری معناداری نداشته باشد.",
         "در نام دارو، دوز، عدد و نفی محافظه‌کار باش. خروجی فقط شناسه است.",
     ]
+    if hypotheses:
+        lines.extend([
+            "",
+            "شش متن کامل برای فهم کل جمله (فقط زمینه؛ پاسخ همچنان باید یکی از گزینه‌های هر بخش باشد):",
+            "در متن‌های Medium/Large که فقط بازهٔ مشکوک را شنیده‌اند، بخش‌های پایدار Turbo درج شده‌اند. "
+            "این بخش درج‌شده رأی صوتی مستقل نیست و حق حذف یا تغییر آن را نداری.",
+        ])
+        for key, payload in hypotheses.items():
+            reconstructed = " [بخش پایدار Turbo درج شده]" \
+                if payload.get("comparison_text_reconstructed") else ""
+            lines.append(f"- {key}{reconstructed}: {payload['text']}")
+        lines.append("تنها بخش‌های شماره‌گذاری‌شدهٔ زیر قابل انتخاب و تغییر هستند.")
     option_maps: dict[str, dict[str, Any]] = {}
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ"
     for region in regions:
@@ -1441,6 +1566,57 @@ def project_audited_changes_onto_v9(v9_text: str, original_slots: list[dict[str,
     return normalize_text(protected_text), projection_audit
 
 
+def ordered_token_coverage(reference: str, candidate: str) -> float:
+    """Measure how much of a stable Turbo span survives in order."""
+    expected = v4.phrase_tokens(reference)
+    observed = v4.phrase_tokens(candidate)
+    if not expected:
+        return 1.0
+    if not observed:
+        return 0.0
+    previous = [0] * (len(observed) + 1)
+    for expected_token in expected:
+        current = [0]
+        for index, observed_token in enumerate(observed, start=1):
+            if v4.token_similarity(expected_token, observed_token) >= 0.70:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(current[-1], previous[index]))
+        previous = current
+    return previous[-1] / len(expected)
+
+
+def adaptive_stable_span_guard(run_dir: Path, candidate_text: str) -> dict[str, Any]:
+    """Reject output that drops Turbo text outside selective review ranges."""
+    plan_path = run_dir / "adaptive-turbo-plan.json"
+    if not plan_path.is_file():
+        return {"enabled": False, "passed": True, "stable_spans": []}
+    plan = load_json(plan_path)
+    if not plan.get("enabled"):
+        return {"enabled": False, "passed": True, "stable_spans": []}
+    spans: list[dict[str, Any]] = []
+    for segment in plan.get("segment_audit") or []:
+        if segment.get("needs_secondary_asr"):
+            continue
+        text = normalize_text(segment.get("text") or "")
+        if len(v4.phrase_tokens(text)) < 4:
+            continue
+        coverage = ordered_token_coverage(text, candidate_text)
+        spans.append({
+            "start": float(segment.get("start") or 0.0),
+            "end": float(segment.get("end") or 0.0),
+            "text": text,
+            "ordered_token_coverage": round(coverage, 4),
+            "passed": coverage >= 0.68,
+        })
+    return {
+        "enabled": bool(spans),
+        "passed": all(row["passed"] for row in spans),
+        "minimum_ordered_token_coverage": 0.68,
+        "stable_spans": spans,
+    }
+
+
 def cleanup_repetitions(text: str) -> tuple[str, list[dict[str, Any]]]:
     tokens = normalize_text(text).split()
     audit: list[dict[str, Any]] = []
@@ -1655,6 +1831,12 @@ def run(run_dir: Path, medical_index: Path, server_url: str, timeout: float,
     exact_medical_terms = build_exact_medical_terms(medical_index)
     allowed_ascii = build_allowed_ascii_terms(medical_index)
     slot_tasks = make_slot_tasks(slots)
+    editable_intervals = adaptive_editable_intervals(hypotheses)
+    if editable_intervals:
+        slot_tasks = [
+            task for task in slot_tasks
+            if slot_in_intervals(slots[int(task["slot"])], editable_intervals)
+        ]
     regions: list[dict[str, Any]] = []
     fallback_reason: str | None = None
     model_calls: list[dict[str, Any]] = []
@@ -1688,7 +1870,7 @@ def run(run_dir: Path, medical_index: Path, server_url: str, timeout: float,
                 apply_slot_audits(slots, slot_audits)
             regions = make_regions(slots, hypotheses, placeholders, max_regions=max_regions)
             if regions:
-                prompt, option_maps = build_prompt(regions)
+                prompt, option_maps = build_prompt(regions, hypotheses)
                 choices, phrase_call = call_local_qwen(
                     server_url, regions, timeout, option_maps, prompt)
                 phrase_call["stage"] = "verbatim-phrase-rerank"
@@ -1744,6 +1926,23 @@ def run(run_dir: Path, medical_index: Path, server_url: str, timeout: float,
         final_text, repetition_cleanup = cleanup_repetitions(final_text)
         final_text, ascii_cleanup = cleanup_unknown_ascii(final_text, allowed_ascii)
         final_text, honorific_cleanup = cleanup_honorific_titles(final_text)
+    coverage_guard = adaptive_stable_span_guard(run_dir, final_text)
+    projection_audit.append({
+        "kind": "adaptive-stable-span-guard",
+        "projected": False,
+        **coverage_guard,
+    })
+    if not coverage_guard["passed"]:
+        for audit in [*audits, *slot_audits]:
+            if audit.get("applied"):
+                audit["selected_text_before_coverage_guard"] = audit.get("selected_text")
+                audit["applied"] = False
+                audit["reason"] = "rejected-adaptive-stable-span-deletion"
+        fallback_reason = "adaptive-stable-span-preservation-guard"
+        final_text = normalize_text(v9.get("text") or "")
+        ascii_cleanup = []
+        repetition_cleanup = []
+        honorific_cleanup = []
     return write_outputs(
         run_dir, v9, final_text, regions, audits, slot_tasks, slot_audits, slot_overlays, model_call,
         time.perf_counter() - started, fallback_reason, ascii_cleanup, repetition_cleanup,
