@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gc
 import importlib.metadata
@@ -102,6 +103,89 @@ def write_subtitles(segments: list[dict[str, Any]], base: Path) -> None:
     base.with_suffix(".vtt").write_text("\n".join(vtt), encoding="utf-8")
 
 
+def script_profile(text: str) -> dict[str, Any]:
+    """Measure whether a forced-Persian transcript is actually Persian-script text."""
+    persian_letters = 0
+    other_letters = 0
+    for character in unicodedata.normalize("NFKC", str(text or "")):
+        if not character.isalpha():
+            continue
+        codepoint = ord(character)
+        if (0x0600 <= codepoint <= 0x06FF
+                or 0x0750 <= codepoint <= 0x077F
+                or 0x08A0 <= codepoint <= 0x08FF
+                or 0xFB50 <= codepoint <= 0xFDFF
+                or 0xFE70 <= codepoint <= 0xFEFF):
+            persian_letters += 1
+        else:
+            other_letters += 1
+    total = persian_letters + other_letters
+    return {
+        "persian_letters": persian_letters,
+        "other_script_letters": other_letters,
+        "alphabetic_letters": total,
+        "persian_script_ratio": round(persian_letters / total, 6) if total else 1.0,
+    }
+
+
+def is_non_persian_script_hallucination(text: str) -> bool:
+    profile = script_profile(text)
+    return (
+        profile["alphabetic_letters"] >= 12
+        and profile["other_script_letters"] >= 8
+        and profile["persian_script_ratio"] < 0.50
+    )
+
+
+def persist_hypothesis(payload: dict[str, Any], out_base: Path) -> None:
+    out_base.parent.mkdir(parents=True, exist_ok=True)
+    out_base.with_suffix(".txt").write_text(
+        str(payload.get("text") or "") + "\n", encoding="utf-8")
+    out_base.with_suffix(".json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_subtitles(list(payload.get("segments") or []), out_base)
+
+
+def apply_persian_script_pair_guard(raw_payload: dict[str, Any],
+                                    enhanced_payload: dict[str, Any]) -> bool:
+    """Replace a foreign-script denoised hallucination with the usable raw branch."""
+    raw_text = str(raw_payload.get("text") or "")
+    enhanced_text = str(enhanced_payload.get("text") or "")
+    raw_profile = script_profile(raw_text)
+    enhanced_profile = script_profile(enhanced_text)
+    raw_bad = is_non_persian_script_hallucination(raw_text)
+    enhanced_bad = is_non_persian_script_hallucination(enhanced_text)
+    guard = {
+        "target_language": "fa",
+        "raw_profile": raw_profile,
+        "enhanced_profile": enhanced_profile,
+        "raw_rejected": raw_bad,
+        "enhanced_rejected": enhanced_bad,
+        "fallback_applied": False,
+    }
+    if enhanced_bad and not raw_bad and raw_text.strip():
+        guard.update({
+            "fallback_applied": True,
+            "rejected_source": "enhanced",
+            "effective_source": "raw",
+            "reason": "non-persian-script-dominance-after-denoising",
+        })
+        enhanced_payload["observed_text_before_script_guard"] = enhanced_text
+        enhanced_payload["text"] = raw_text
+        enhanced_payload["segments"] = copy.deepcopy(raw_payload.get("segments") or [])
+        enhanced_payload["effective_audio_source"] = "raw"
+        warning = str(enhanced_payload.get("warning") or "").strip()
+        message = (
+            "Denoised ASR was rejected because non-Persian script dominated; "
+            "the raw-audio hypothesis is used instead.")
+        enhanced_payload["warning"] = f"{warning} {message}".strip()
+    enhanced_payload["language_guard"] = guard
+    raw_payload["script_profile"] = raw_profile
+    enhanced_payload["script_profile"] = script_profile(
+        str(enhanced_payload.get("text") or ""))
+    return bool(guard["fallback_applied"])
+
+
 def transcribe_one(model_path: Path, audio: Path, out_base: Path, model_name: str,
                    source: str, device: str, compute_type: str, threads: int, log,
                    loaded_model: WhisperModel | None = None,
@@ -139,16 +223,15 @@ def transcribe_one(model_path: Path, audio: Path, out_base: Path, model_name: st
         "model": model_name, "source": source, "model_path": str(model_path),
         "audio": str(audio), "hardware": platform.processor(), "device": device,
         "compute_type": compute_type, "cpu_threads": threads,
+        "requested_language": "fa", "language_was_forced": True,
         "detected_language": info.language,
         "detected_language_probability": info.language_probability,
         "duration": info.duration, "duration_after_vad": info.duration_after_vad,
         "load_seconds": model_load_seconds, "transcription_seconds": transcribe_seconds,
         "warning": warning, "error": None, "text": text, "segments": segments,
     }
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    out_base.with_suffix(".txt").write_text(text + "\n", encoding="utf-8")
-    out_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_subtitles(segments, out_base)
+    payload["script_profile"] = script_profile(text)
+    persist_hypothesis(payload, out_base)
     log.write(f"Completed {model_name}/{source}: load={model_load_seconds:.2f}s transcribe={transcribe_seconds:.2f}s\n")
     if owns_model:
         del model
@@ -164,6 +247,7 @@ def empty_hypothesis(audio: Path, out_base: Path, model_name: str, source: str,
         "model": model_name, "source": source, "model_path": None,
         "audio": str(audio), "hardware": platform.processor(), "device": device,
         "compute_type": compute_type, "cpu_threads": threads,
+        "requested_language": "fa", "language_was_forced": True,
         "detected_language": "fa", "detected_language_probability": None,
         "duration": 0.0, "duration_after_vad": 0.0,
         "load_seconds": 0.0, "transcription_seconds": 0.0,
@@ -207,6 +291,30 @@ def turbo_uncertainty_intervals(raw_payload: dict[str, Any],
     This is deliberately recall-oriented: it can spend more compute, but it
     must not silently skip a low-confidence or medically sensitive Turbo span.
     """
+    language_guard = enhanced_payload.get("language_guard") or {}
+    if language_guard.get("fallback_applied"):
+        reason = str(language_guard.get("reason") or "enhanced-language-guard-fallback")
+        interval = {"start": 0.0, "end": round(duration, 3), "reasons": [reason]}
+        segment_audit = [
+            {
+                "start": round(float(segment.get("start") or 0.0), 3),
+                "end": round(float(segment.get("end") or 0.0), 3),
+                "text": str(segment.get("text") or "").strip(),
+                "raw_enhanced_similarity": 0.0,
+                "reasons": [reason],
+                "needs_secondary_asr": True,
+            }
+            for segment in raw_payload.get("segments") or []
+        ]
+        return [interval], {
+            "policy": "Turbo raw+enhanced first; secondary families only on uncertain spans",
+            "audio_duration_seconds": round(duration, 3),
+            "review_interval_count": 1,
+            "review_coverage_ratio": 1.0,
+            "segment_audit": segment_audit,
+            "forced_full_review": True,
+            "forced_full_review_reason": reason,
+        }
     raw_segments = list(raw_payload.get("segments") or [])
     raw_words = words_of(raw_payload)
     flagged: list[dict[str, Any]] = []
@@ -346,6 +454,7 @@ def transcribe_selective(model_path: Path, audio: Path, out_base: Path,
         "model": model_name, "source": source, "model_path": str(model_path),
         "audio": str(audio), "hardware": platform.processor(), "device": device,
         "compute_type": compute_type, "cpu_threads": threads,
+        "requested_language": "fa", "language_was_forced": True,
         "detected_language": "fa",
         "detected_language_probability": (
             sum(language_probabilities) / len(language_probabilities)
@@ -357,11 +466,8 @@ def transcribe_selective(model_path: Path, audio: Path, out_base: Path,
         "warning": None, "error": None, "text": text, "segments": all_segments,
         "selective_intervals": intervals, "selective_secondary_asr": True,
     }
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    out_base.with_suffix(".txt").write_text(text + "\n", encoding="utf-8")
-    out_base.with_suffix(".json").write_text(
-        json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_subtitles(all_segments, out_base)
+    result["script_profile"] = script_profile(text)
+    persist_hypothesis(result, out_base)
     return result
 
 
@@ -539,6 +645,17 @@ def main() -> None:
                 hypotheses[key] = payload
                 timings.append({"stage": key, "load_seconds": payload["load_seconds"],
                                 "processing_seconds": payload["transcription_seconds"]})
+            raw_key = f"{turbo_name}__raw"
+            enhanced_key = f"{turbo_name}__enhanced"
+            turbo_language_fallback = apply_persian_script_pair_guard(
+                hypotheses[raw_key], hypotheses[enhanced_key])
+            persist_hypothesis(
+                hypotheses[enhanced_key],
+                run_dir / "hypotheses" / enhanced_key / enhanced_key)
+            if turbo_language_fallback:
+                log.write(
+                    "Rejected non-Persian-script Turbo/enhanced output; "
+                    "using Turbo/raw and forcing full secondary review.\n")
             del loaded_model
             gc.collect()
 
@@ -608,6 +725,17 @@ def main() -> None:
                         "processing_seconds": payload["transcription_seconds"],
                         "selective_interval_count": len(intervals),
                     })
+                raw_key = f"{model_name}__raw"
+                enhanced_key = f"{model_name}__enhanced"
+                secondary_language_fallback = apply_persian_script_pair_guard(
+                    hypotheses[raw_key], hypotheses[enhanced_key])
+                persist_hypothesis(
+                    hypotheses[enhanced_key],
+                    run_dir / "hypotheses" / enhanced_key / enhanced_key)
+                if secondary_language_fallback:
+                    log.write(
+                        f"Rejected non-Persian-script {model_name}/enhanced output; "
+                        f"using {model_name}/raw.\n")
                 del loaded_model
                 gc.collect()
             adaptive_work_root = run_dir / "adaptive-secondary-work"
@@ -649,6 +777,17 @@ def main() -> None:
                     hypotheses[key] = payload
                     timings.append({"stage": key, "load_seconds": payload["load_seconds"],
                                     "processing_seconds": payload["transcription_seconds"]})
+                raw_key = f"{model_name}__raw"
+                enhanced_key = f"{model_name}__enhanced"
+                model_language_fallback = apply_persian_script_pair_guard(
+                    hypotheses[raw_key], hypotheses[enhanced_key])
+                persist_hypothesis(
+                    hypotheses[enhanced_key],
+                    run_dir / "hypotheses" / enhanced_key / enhanced_key)
+                if model_language_fallback:
+                    log.write(
+                        f"Rejected non-Persian-script {model_name}/enhanced output; "
+                        f"using {model_name}/raw.\n")
                 del loaded_model
                 gc.collect()
 

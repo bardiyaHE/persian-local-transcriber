@@ -5,6 +5,7 @@
 1. FFprobe detects the actual audio stream instead of trusting the filename extension.
 2. FFmpeg converts the source to normalized mono PCM.
 3. DeepFilterNet creates a noise-reduced copy while the raw normalized copy is retained.
+4. Whisper is explicitly forced to Persian (`fa`). A script-quality guard rejects a denoised branch when non-Persian letters dominate while the raw branch remains valid. The raw hypothesis becomes the safe fallback, and Full mode sends the complete audio to the secondary ASR families for review.
 
 ## Lite profile
 
