@@ -147,6 +147,78 @@ def stitch_selective_hypothesis(payload: dict[str, Any],
     return normalize_text(" ".join(stitched))
 
 
+def word_midpoint_in_intervals(word: dict[str, Any],
+                               intervals: list[dict[str, Any]]) -> bool:
+    midpoint = (float(word["start"]) + float(word["end"])) / 2.0
+    return any(
+        float(interval["start"]) <= midpoint <= float(interval["end"])
+        for interval in intervals
+    )
+
+
+def stitch_cascade_medium_hypothesis(payload: dict[str, Any],
+                                     large_payload: dict[str, Any],
+                                     adaptive_plan: dict[str, Any]) -> str:
+    """Build a full Medium view on top of Large, replacing only Medium-reviewed spans."""
+    audit = sorted(
+        adaptive_plan.get("segment_audit") or [],
+        key=lambda row: float(row.get("start") or 0.0),
+    )
+    if not audit:
+        return ""
+    medium_intervals = (
+        list(adaptive_plan.get("medium_review_intervals") or [])
+        if "medium_review_intervals" in adaptive_plan
+        else list(payload.get("coverage_intervals") or [])
+    )
+    medium_words = list(payload.get("words") or [])
+    large_words = list(large_payload.get("words") or [])
+    active_medium_intervals = [
+        interval for interval in medium_intervals
+        if any(word_midpoint_in_intervals(word, [interval]) for word in medium_words)
+    ]
+    stitched: list[str] = []
+    for index, segment in enumerate(audit):
+        turbo_text = normalize_text(segment.get("text") or "")
+        if not segment.get("needs_secondary_asr"):
+            if turbo_text:
+                stitched.append(turbo_text)
+            continue
+        start = float(segment.get("start") or 0.0)
+        end = float(segment.get("end") or start)
+        large_selected = [
+            word for word in large_words
+            if start <= (float(word["start"]) + float(word["end"])) / 2.0 <= end
+            and not word_midpoint_in_intervals(word, active_medium_intervals)
+        ]
+        medium_selected = [
+            word for word in medium_words
+            if start <= (float(word["start"]) + float(word["end"])) / 2.0 <= end
+            and word_midpoint_in_intervals(word, active_medium_intervals)
+        ]
+        selected = sorted(
+            [*large_selected, *medium_selected],
+            key=lambda word: (float(word["start"]), float(word["end"])),
+        )
+        previous_stable = stitched[-1] if stitched else ""
+        next_stable = ""
+        for following in audit[index + 1:]:
+            if not following.get("needs_secondary_asr"):
+                next_stable = normalize_text(following.get("text") or "")
+                break
+        reviewed_text = trim_boundary_overlap(
+            " ".join(str(word["word"]) for word in selected),
+            previous_stable, next_stable)
+        if not reviewed_text:
+            large_fallback = [
+                str(word["word"]) for word in large_words
+                if start <= (float(word["start"]) + float(word["end"])) / 2.0 <= end
+            ]
+            reviewed_text = normalize_text(" ".join(large_fallback)) or turbo_text
+        stitched.append(reviewed_text)
+    return normalize_text(" ".join(stitched))
+
+
 def load_hypotheses(run_dir: Path) -> dict[str, dict[str, Any]]:
     loaded: dict[str, dict[str, Any]] = {}
     plan_path = run_dir / "adaptive-turbo-plan.json"
@@ -159,19 +231,32 @@ def load_hypotheses(run_dir: Path) -> dict[str, dict[str, Any]]:
         for segment in adaptive_plan.get("segment_audit") or []
         if segment.get("needs_secondary_asr")
     ]
+    source_payloads = {
+        key: load_json(hypothesis_json_path(run_dir, key))
+        for key in HYPOTHESES
+    }
+    flattened = {key: flatten_words(payload) for key, payload in source_payloads.items()}
     for key in HYPOTHESES:
-        payload = load_json(hypothesis_json_path(run_dir, key))
+        payload = source_payloads[key]
         row = {
             "text": normalize_text(payload.get("text") or ""),
             "duration": float(payload.get("duration") or 0.0),
-            "words": flatten_words(payload),
+            "words": flattened[key],
             "selective_secondary_asr": bool(payload.get("selective_secondary_asr")),
             "coverage_intervals": list(payload.get("selective_intervals") or []),
             "adaptive_editable_intervals": editable_intervals,
+            "cascade_parent_model": payload.get("cascade_parent_model"),
         }
         row["observed_text"] = row["text"]
         if row["selective_secondary_asr"]:
-            stitched = stitch_selective_hypothesis(row, adaptive_plan)
+            if key.startswith("medium__"):
+                large_key = key.replace("medium__", "large-v3__", 1)
+                stitched = stitch_cascade_medium_hypothesis(
+                    row, {"words": flattened[large_key]}, adaptive_plan)
+                row["comparison_backbone"] = large_key
+            else:
+                stitched = stitch_selective_hypothesis(row, adaptive_plan)
+                row["comparison_backbone"] = "large-v3-turbo"
             if stitched:
                 row["text"] = stitched
                 row["comparison_text_reconstructed"] = True
@@ -1037,11 +1122,12 @@ def build_prompt(regions: list[dict[str, Any]],
         lines.extend([
             "",
             "شش متن کامل برای فهم کل جمله (فقط زمینه؛ پاسخ همچنان باید یکی از گزینه‌های هر بخش باشد):",
-            "در متن‌های Medium/Large که فقط بازهٔ مشکوک را شنیده‌اند، بخش‌های پایدار Turbo درج شده‌اند. "
-            "این بخش درج‌شده رأی صوتی مستقل نیست و حق حذف یا تغییر آن را نداری.",
+            "در متن‌های Large/Medium که فقط بازهٔ مشکوک را شنیده‌اند، بخش‌های نشنیده از مرحلهٔ "
+            "قبلی آبشار (Turbo یا Large) درج شده‌اند. این بخش درج‌شده رأی صوتی مستقل نیست و حق "
+            "حذف یا تغییر آن را نداری.",
         ])
         for key, payload in hypotheses.items():
-            reconstructed = " [بخش پایدار Turbo درج شده]" \
+            reconstructed = " [بخش‌های نشنیده از مرحلهٔ قبلی درج شده]" \
                 if payload.get("comparison_text_reconstructed") else ""
             lines.append(f"- {key}{reconstructed}: {payload['text']}")
         lines.append("تنها بخش‌های شماره‌گذاری‌شدهٔ زیر قابل انتخاب و تغییر هستند.")

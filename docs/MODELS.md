@@ -23,4 +23,11 @@ Model weights and runtime binaries are not stored in this Git repository. Setup 
 - Pinned revision: `e8f8c211226b894fcb81acc59f3b34ba3efd5f42`
 - Runtime file: `onnx/model_quint8_avx2.onnx`
 
+## Audio enhancement
+
+- Music/background separation: `adefossez/HTDemucs`, model `htdemucs`, pinned revision `cbc8a9b1a87023b7fd74e7b3412e6321c0eab003`.
+- Speaker diarization: `pyannote/speaker-diarization-community-1` with `pyannote.audio==4.0.7`.
+- The pyannote repository is gated. Users must accept its model terms and provide a Hugging Face read token during setup.
+- Demucs and pyannote run in separate pinned Python environments because their Torch versions differ. Runtime inference is offline.
+
 Upstream model cards and licenses govern model use and redistribution. Review them before commercial deployment. This repository does not redistribute the weights.

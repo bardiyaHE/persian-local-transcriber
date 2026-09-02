@@ -23,7 +23,7 @@ from faster_whisper import WhisperModel
 
 
 MODEL_ORDER = ["medium", "large-v3-turbo", "large-v3"]
-SECONDARY_MODEL_ORDER = ["medium", "large-v3"]
+SECONDARY_MODEL_ORDER = ["large-v3", "medium"]
 SOURCE_ORDER = ["raw", "enhanced"]
 SENSITIVE = {
     "قرص", "کپسول", "شربت", "آمپول", "دارو", "دوز", "واحد", "درصد",
@@ -253,6 +253,7 @@ def empty_hypothesis(audio: Path, out_base: Path, model_name: str, source: str,
         "load_seconds": 0.0, "transcription_seconds": 0.0,
         "warning": reason, "error": None, "text": "", "segments": [],
         "selective_intervals": [], "selective_secondary_asr": True,
+        "cascade_parent_model": "large-v3" if model_name == "medium" else "large-v3-turbo",
     }
     out_base.parent.mkdir(parents=True, exist_ok=True)
     out_base.with_suffix(".txt").write_text("\n", encoding="utf-8")
@@ -307,7 +308,7 @@ def turbo_uncertainty_intervals(raw_payload: dict[str, Any],
             for segment in raw_payload.get("segments") or []
         ]
         return [interval], {
-            "policy": "Turbo raw+enhanced first; secondary families only on uncertain spans",
+            "policy": "Turbo first; Large reviews Turbo uncertainty; Medium reviews only residual Large uncertainty",
             "audio_duration_seconds": round(duration, 3),
             "review_interval_count": 1,
             "review_coverage_ratio": 1.0,
@@ -393,11 +394,146 @@ def turbo_uncertainty_intervals(raw_payload: dict[str, Any],
     covered = sum(float(row["end"]) - float(row["start"]) for row in intervals)
     coverage = min(1.0, covered / max(duration, 0.001))
     return intervals, {
-        "policy": "Turbo raw+enhanced first; secondary families only on uncertain spans",
+        "policy": "Turbo first; Large reviews Turbo uncertainty; Medium reviews only residual Large uncertainty",
         "audio_duration_seconds": round(duration, 3),
         "review_interval_count": len(intervals),
         "review_coverage_ratio": round(coverage, 6),
         "segment_audit": segment_audit,
+    }
+
+
+def intersect_review_intervals(intervals: list[dict[str, Any]],
+                               allowed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    intersections: list[dict[str, Any]] = []
+    for candidate in intervals:
+        for boundary in allowed:
+            start = max(float(candidate["start"]), float(boundary["start"]))
+            end = min(float(candidate["end"]), float(boundary["end"]))
+            if end <= start:
+                continue
+            reasons = sorted(set(candidate.get("reasons") or [])
+                             | set(boundary.get("reasons") or []))
+            intersections.append({"start": start, "end": end, "reasons": reasons})
+    intersections.sort(key=lambda row: (row["start"], row["end"]))
+    merged: list[dict[str, Any]] = []
+    for row in intersections:
+        if merged and row["start"] <= merged[-1]["end"] + 0.05:
+            merged[-1]["end"] = max(merged[-1]["end"], row["end"])
+            merged[-1]["reasons"] = sorted(
+                set(merged[-1]["reasons"]) | set(row["reasons"]))
+        else:
+            merged.append(dict(row))
+    return [
+        {"start": round(row["start"], 3), "end": round(row["end"], 3),
+         "reasons": row["reasons"]}
+        for row in merged
+    ]
+
+
+def large_residual_uncertainty_intervals(
+        raw_payload: dict[str, Any], enhanced_payload: dict[str, Any],
+        allowed_intervals: list[dict[str, Any]], duration: float
+        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return only spans that remain unclear after the Large V3 review."""
+    if not allowed_intervals:
+        return [], {"review_interval_count": 0, "review_coverage_ratio": 0.0,
+                    "segment_audit": []}
+    language_guard = enhanced_payload.get("language_guard") or {}
+    if language_guard.get("fallback_applied"):
+        reason = "large-enhanced-language-guard-fallback"
+        rows = [
+            {"start": float(row["start"]), "end": float(row["end"]),
+             "reasons": sorted(set(row.get("reasons") or []) | {reason})}
+            for row in allowed_intervals
+        ]
+        covered = sum(row["end"] - row["start"] for row in rows)
+        return rows, {
+            "review_interval_count": len(rows),
+            "review_coverage_ratio": round(covered / max(duration, 0.001), 6),
+            "segment_audit": [],
+            "forced_by_language_guard": True,
+        }
+
+    raw_segments = list(raw_payload.get("segments") or [])
+    enhanced_segments = list(enhanced_payload.get("segments") or [])
+    raw_words = words_of(raw_payload)
+    flagged: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+    if raw_segments and not enhanced_segments:
+        reason = "large-enhanced-missing"
+        return intersect_review_intervals([
+            {"start": row["start"], "end": row["end"], "reasons": [reason]}
+            for row in allowed_intervals
+        ], allowed_intervals), {
+            "review_interval_count": len(allowed_intervals),
+            "review_coverage_ratio": round(sum(
+                float(row["end"]) - float(row["start"])
+                for row in allowed_intervals) / max(duration, 0.001), 6),
+            "segment_audit": [],
+        }
+
+    for segment in enhanced_segments:
+        reasons: set[str] = set()
+        segment_words = list(segment.get("words") or [])
+        probabilities = [float(row.get("probability") or 0.0) for row in segment_words]
+        if float(segment.get("avg_logprob") or -2.0) < -0.78:
+            reasons.add("large-low-segment-logprob")
+        if float(segment.get("compression_ratio") or 0.0) > 2.20:
+            reasons.add("large-high-compression-ratio")
+        if float(segment.get("no_speech_prob") or 0.0) > 0.45:
+            reasons.add("large-possible-nonspeech")
+        if probabilities and sum(probabilities) / len(probabilities) < 0.58:
+            reasons.add("large-low-mean-word-probability")
+
+        overlapping_raw = [
+            row for row in raw_segments
+            if min(float(row["end"]), float(segment["end"]))
+            > max(float(row["start"]), float(segment["start"]))
+        ]
+        raw_text = " ".join(str(row.get("text") or "") for row in overlapping_raw)
+        enhanced_text = str(segment.get("text") or "")
+        agreement = SequenceMatcher(
+            None, norm(enhanced_text), norm(raw_text), autojunk=False).ratio()
+        if raw_text and agreement < 0.70:
+            reasons.add("large-raw-enhanced-disagreement")
+        if not raw_text:
+            reasons.add("large-missing-raw-counterpart")
+
+        for word in segment_words:
+            if float(word.get("probability") or 0.0) < 0.38:
+                reasons.add("large-very-low-word-probability")
+            best_raw = max(
+                raw_words, key=lambda row: temporal_similarity(word, row), default=None)
+            if best_raw and temporal_similarity(word, best_raw) >= 0.45:
+                lexical = SequenceMatcher(
+                    None, norm(str(word.get("word") or "")),
+                    norm(str(best_raw.get("word") or "")), autojunk=False).ratio()
+                if lexical < 0.68:
+                    reasons.add("large-word-level-disagreement")
+
+        if reasons:
+            flagged.append({
+                "start": float(segment.get("start") or 0.0),
+                "end": float(segment.get("end") or 0.0),
+                "reasons": sorted(reasons),
+            })
+        audit.append({
+            "start": round(float(segment.get("start") or 0.0), 3),
+            "end": round(float(segment.get("end") or 0.0), 3),
+            "text": enhanced_text.strip(),
+            "raw_enhanced_similarity": round(agreement, 6),
+            "reasons": sorted(reasons),
+            "needs_medium_asr": bool(reasons),
+        })
+
+    residual = intersect_review_intervals(
+        merge_intervals(flagged, duration, padding=0.65, join_gap=0.45),
+        allowed_intervals)
+    covered = sum(float(row["end"]) - float(row["start"]) for row in residual)
+    return residual, {
+        "review_interval_count": len(residual),
+        "review_coverage_ratio": round(covered / max(duration, 0.001), 6),
+        "segment_audit": audit,
     }
 
 
@@ -465,6 +601,7 @@ def transcribe_selective(model_path: Path, audio: Path, out_base: Path,
         "transcription_seconds": total_transcription,
         "warning": None, "error": None, "text": text, "segments": all_segments,
         "selective_intervals": intervals, "selective_secondary_asr": True,
+        "cascade_parent_model": "large-v3" if model_name == "medium" else "large-v3-turbo",
     }
     result["script_profile"] = script_profile(text)
     persist_hypothesis(result, out_base)
@@ -552,6 +689,60 @@ def merge(hypotheses: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str, An
     return "".join(output).strip(), decisions
 
 
+def resolve_runtime_path(root: Path, value: str | Path) -> Path:
+    path = Path(value)
+    return path.resolve() if path.is_absolute() else (root / path).resolve()
+
+
+def pyannote_runtime(root: Path) -> dict[str, Path]:
+    values: dict[str, str | Path] = {
+        "demucs_python": "runtime/demucs-venv/Scripts/python.exe",
+        "pyannote_python": "runtime/pyannote-venv/Scripts/python.exe",
+        "demucs_cache": "runtime/demucs-cache",
+        "pyannote_cache": "runtime/pyannote-cache",
+    }
+    config_path = root / "runtime" / "pyannote-enhancer.json"
+    if config_path.is_file():
+        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        for key in values:
+            if payload.get(key):
+                values[key] = payload[key]
+    return {key: resolve_runtime_path(root, value) for key, value in values.items()}
+
+
+def create_pyannote_enhanced_audio(root: Path, run_dir: Path, normalized: Path,
+                                   ffmpeg: Path, device: str, log) -> tuple[Path, dict, float]:
+    runtime = pyannote_runtime(root)
+    enhancer = root / "src" / "pyannote_enhancer.py"
+    diarizer = root / "src" / "pyannote_diarize.py"
+    required = [enhancer, diarizer, runtime["demucs_python"], runtime["pyannote_python"]]
+    for path in required:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Required Demucs/pyannote component is missing: {path}. Run setup.ps1.")
+    enhanced = run_dir / "enhanced_pyannote.wav"
+    work_dir = run_dir / "pyannote-enhancement"
+    command = [
+        sys.executable, str(enhancer), "--audio", str(normalized),
+        "--output", str(enhanced), "--work-dir", str(work_dir),
+        "--ffmpeg", str(ffmpeg),
+        "--demucs-python", str(runtime["demucs_python"]),
+        "--pyannote-python", str(runtime["pyannote_python"]),
+        "--pyannote-runner", str(diarizer),
+        "--demucs-cache", str(runtime["demucs_cache"]),
+        "--pyannote-cache", str(runtime["pyannote_cache"]),
+        "--device", device,
+    ]
+    started = time.perf_counter()
+    run(command, log)
+    elapsed = time.perf_counter() - started
+    report_path = work_dir / "enhancement-report.json"
+    if not enhanced.is_file() or not report_path.is_file():
+        raise RuntimeError("Demucs/pyannote enhancement did not produce its required outputs")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    return enhanced, report, elapsed
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, required=True)
@@ -563,8 +754,8 @@ def main() -> None:
     parser.add_argument("--profile", choices=["lite", "full"], default="full")
     parser.add_argument(
         "--adaptive-turbo", action="store_true",
-        help=("Transcribe Turbo raw+enhanced first and run medium/large-v3 only "
-              "on uncertain or medically sensitive intervals."),
+        help=("Transcribe Turbo raw+enhanced first, run Large on Turbo-uncertain "
+              "intervals, then run Medium only on residual Large uncertainty."),
     )
     args = parser.parse_args()
     if args.profile == "lite":
@@ -582,8 +773,7 @@ def main() -> None:
         log.write(f"run_id={run_id}\nsource={audio}\n")
         ffmpeg = root / "runtime" / "ffmpeg" / "ffmpeg.exe"
         ffprobe = root / "runtime" / "ffmpeg" / "ffprobe.exe"
-        deepfilter = root / "runtime" / "deepfilternet" / "deep-filter.exe"
-        for tool in (ffmpeg, ffprobe, deepfilter):
+        for tool in (ffmpeg, ffprobe):
             if not tool.is_file():
                 raise FileNotFoundError(f"Required local tool missing: {tool}. Run setup.ps1.")
         raw_meta = probe(ffprobe, audio, log)
@@ -596,16 +786,8 @@ def main() -> None:
              "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(normalized)], log)
         normalize_seconds = time.perf_counter() - start
         normalized_meta = probe(ffprobe, normalized, log)
-        df_temp = run_dir / "deepfilter-work"
-        df_temp.mkdir()
-        start = time.perf_counter()
-        df_result = run([str(deepfilter), "--compensate-delay", "--output-dir", str(df_temp), str(normalized)], log)
-        deepfilter_seconds = time.perf_counter() - start
-        produced = [p for p in df_temp.glob("*.wav") if p.is_file()]
-        if len(produced) != 1:
-            raise RuntimeError(f"DeepFilterNet did not produce exactly one WAV: {produced}\n{df_result.stdout}")
-        enhanced = run_dir / "enhanced_deepfilternet.wav"
-        shutil.move(str(produced[0]), enhanced)
+        enhanced, enhancement_report, enhancement_seconds = create_pyannote_enhanced_audio(
+            root, run_dir, normalized, ffmpeg, args.device, log)
         enhanced_meta = probe(ffprobe, enhanced, log)
         hypotheses: dict[str, dict[str, Any]] = {}
         timings = []
@@ -669,20 +851,27 @@ def main() -> None:
                 "secondary_models": secondary_model_order,
                 "secondary_sources": SOURCE_ORDER,
                 "review_intervals": intervals,
+                "large_review_intervals": intervals,
+                "medium_review_intervals": [],
+                "cascade_order": ["large-v3-turbo", "large-v3", "medium"],
             })
             (run_dir / "adaptive-turbo-plan.json").write_text(
                 json.dumps(adaptive_plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
+            medium_intervals: list[dict[str, Any]] = []
             for model_name in secondary_model_order:
+                model_intervals = intervals if model_name == "large-v3" else medium_intervals
                 model_path = root / "models" / model_name
-                if not intervals:
+                if not model_intervals:
                     for source in SOURCE_ORDER:
                         key = f"{model_name}__{source}"
                         base = run_dir / "hypotheses" / key / key
                         payload = empty_hypothesis(
                             audio_sources[source], base, model_name, source,
                             args.device, args.compute_type, args.threads,
-                            "Turbo confidence gate found no interval requiring this family.")
+                            ("Turbo confidence gate found no interval requiring Large V3."
+                             if model_name == "large-v3" else
+                             "Large V3 resolved every reviewed interval; Medium was skipped."))
                         hypotheses[key] = payload
                         timings.append({"stage": key, "load_seconds": 0.0,
                                         "processing_seconds": 0.0,
@@ -709,11 +898,11 @@ def main() -> None:
                             model_path, audio_sources[source], base, model_name, source,
                             args.device, args.compute_type, args.threads, log,
                             loaded_model, (shared_load_seconds if source == SOURCE_ORDER[0] else 0.0),
-                            intervals, ffmpeg, selective_work)
+                            model_intervals, ffmpeg, selective_work)
                     except Exception as exc:
                         error = {"model": model_name, "source": source, "error": str(exc),
                                  "device": args.device, "compute_type": args.compute_type,
-                                 "selective_intervals": intervals}
+                                 "selective_intervals": model_intervals}
                         base.parent.mkdir(parents=True, exist_ok=True)
                         base.with_suffix(".error.json").write_text(
                             json.dumps(error, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -723,7 +912,7 @@ def main() -> None:
                     timings.append({
                         "stage": key, "load_seconds": payload["load_seconds"],
                         "processing_seconds": payload["transcription_seconds"],
-                        "selective_interval_count": len(intervals),
+                        "selective_interval_count": len(model_intervals),
                     })
                 raw_key = f"{model_name}__raw"
                 enhanced_key = f"{model_name}__enhanced"
@@ -736,6 +925,17 @@ def main() -> None:
                     log.write(
                         f"Rejected non-Persian-script {model_name}/enhanced output; "
                         f"using {model_name}/raw.\n")
+                if model_name == "large-v3":
+                    medium_intervals, residual_plan = large_residual_uncertainty_intervals(
+                        hypotheses[raw_key], hypotheses[enhanced_key], intervals, duration)
+                    adaptive_plan["medium_review_intervals"] = medium_intervals
+                    adaptive_plan["large_residual_review"] = residual_plan
+                    adaptive_plan["medium_review_coverage_ratio"] = round(sum(
+                        float(row["end"]) - float(row["start"])
+                        for row in medium_intervals) / max(duration, 0.001), 6)
+                    (run_dir / "adaptive-turbo-plan.json").write_text(
+                        json.dumps(adaptive_plan, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
                 del loaded_model
                 gc.collect()
             adaptive_work_root = run_dir / "adaptive-secondary-work"
@@ -840,8 +1040,7 @@ def main() -> None:
             "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
             "packages": {name: importlib.metadata.version(name) for name in
                          ["faster-whisper", "ctranslate2", "huggingface-hub", "numpy"]},
-            "deepfilternet": "0.5.6 official x86_64-pc-windows-msvc binary",
-            "deepfilternet_command": subprocess.list2cmdline([str(deepfilter), "--compensate-delay", "--output-dir", str(df_temp), str(normalized)]),
+            "audio_enhancement": enhancement_report,
         }
         (run_dir / "system-info.json").write_text(json.dumps(system_info, ensure_ascii=False, indent=2), encoding="utf-8")
         rows = []
@@ -859,8 +1058,9 @@ def main() -> None:
         report = [
             "# گزارش اجرای محلی", "",
             f"- شناسه اجرا: `{run_id}`", f"- دستگاه: `{args.device}` / `{args.compute_type}` / {args.threads} CPU threads",
-            f"- تبدیل FFmpeg: {normalize_seconds:.2f} ثانیه", f"- نویزگیری DeepFilterNet: {deepfilter_seconds:.2f} ثانیه",
-            "- DeepFilterNet: نسخه 0.5.6، باینری رسمی Windows x64، با `--compensate-delay`",
+            f"- تبدیل FFmpeg: {normalize_seconds:.2f} ثانیه",
+            f"- جداسازی پس‌زمینه و گوینده با Demucs + pyannote: {enhancement_seconds:.2f} ثانیه",
+            "- زنجیرهٔ enhanced: HTDemucs برای حذف موسیقی، سپس pyannote Community-1 و نگه‌داشتن گویندهٔ غالب",
             "", "## مشخصات صدا", "", "### خام", "", "```json", json.dumps(raw_meta, ensure_ascii=False, indent=2), "```",
             "", "### WAV نرمال‌شده", "", "```json", json.dumps(normalized_meta, ensure_ascii=False, indent=2), "```",
             "", "### نویزگیری‌شده", "", "```json", json.dumps(enhanced_meta, ensure_ascii=False, indent=2), "```",
@@ -883,6 +1083,7 @@ def main() -> None:
         (run_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
         summary = {"run_id": run_id, "run_dir": str(run_dir), "delivery": str(delivery),
                    "raw_metadata": raw_meta, "enhanced_metadata": enhanced_meta,
+                   "audio_enhancement": enhancement_report,
                    "timings": timings, "device": args.device, "compute_type": args.compute_type,
                    "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
                    "adaptive_turbo_plan": adaptive_plan,

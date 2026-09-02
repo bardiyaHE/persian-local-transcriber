@@ -33,12 +33,18 @@ def main() -> None:
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     system_info = json.loads((run_dir / "system-info.json").read_text(encoding="utf-8"))
     sensitive = [d for d in decisions if d["locked"] or norm(d["base"]) != norm(d["chosen"])]
+    enhancement_lines = ([
+        "- زنجیرهٔ enhanced: HTDemucs + pyannote Community-1",
+        "- سیاست گوینده: نگه‌داشتن گویندهٔ غالب در صورت تشخیص چند گوینده",
+    ] if system_info.get("audio_enhancement") else [
+        f"- DeepFilterNet: {system_info.get('deepfilternet', 'legacy')}",
+        f"- فرمان دقیق DeepFilterNet: `{system_info.get('deepfilternet_command', '')}`",
+    ])
     report = [
         "# گزارش اجرای محلی", "",
         f"- شناسه اجرا: `{summary['run_id']}`",
         f"- دستگاه: `{summary['device']}` / `{summary['compute_type']}` / {system_info['used_cpu_threads']} CPU threads",
-        f"- DeepFilterNet: {system_info['deepfilternet']}",
-        f"- فرمان دقیق DeepFilterNet: `{system_info['deepfilternet_command']}`",
+        *enhancement_lines,
         "", "## مشخصات صدای خام", "", "```json",
         json.dumps(summary["raw_metadata"], ensure_ascii=False, indent=2), "```",
         "", "## مشخصات صدای نویزگیری‌شده", "", "```json",

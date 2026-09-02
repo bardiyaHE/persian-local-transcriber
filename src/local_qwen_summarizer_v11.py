@@ -24,6 +24,7 @@ from local_qwen_reranker_v10 import (
     LOCAL_MODEL_REVISION,
     NUMBER_WORDS,
     UNITS,
+    load_hypotheses as load_comparison_hypotheses,
     normalize_text,
     tokens_of,
 )
@@ -523,6 +524,16 @@ def load_hypothesis_evidence(run_dir: Path) -> dict[str, str]:
     root = run_dir / "hypotheses"
     if not root.is_dir():
         return hypotheses
+    try:
+        comparison_rows = load_comparison_hypotheses(run_dir)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        comparison_rows = {}
+    if comparison_rows:
+        for name, payload in comparison_rows.items():
+            text = normalize_text(payload.get("text") or "")
+            if text and not hypothesis_is_degenerate(text):
+                hypotheses[name] = text
+        return hypotheses
     plan_path = run_dir / "adaptive-turbo-plan.json"
     adaptive_plan = load_json(plan_path) if plan_path.is_file() else {}
     for path in sorted(root.glob("*/*.json")):
@@ -559,6 +570,9 @@ def load_hypothesis_coverage(run_dir: Path) -> dict[str, dict[str, Any]]:
             "observed_scope": "reviewed-intervals-only" if selective else "full-audio",
             "selective_secondary_asr": selective,
             "stable_turbo_spans_inserted": selective,
+            "previous_stage_spans_inserted": selective,
+            "comparison_backbone": payload.get("cascade_parent_model") or (
+                "large-v3" if path.stem.startswith("medium__") else "large-v3-turbo"),
             "intervals": intervals,
             "observed_text": normalize_text(payload.get("text") or "") if selective else "",
         }
@@ -1088,8 +1102,9 @@ def build_prompt(source_text: str, v9: dict[str, Any],
         "باید ادامه یابد ولی فیلر فقط بلامانع است، ننویس «دوز و فیلر ادامه یابد».",
         "7) متن پایه قبلاً از مقایسهٔ چند رونویسی ساخته شده است. بعضی مدل‌های ثانویه ممکن است فقط "
         "بازهٔ نامطمئن را شنیده باشند. نبودن ابتدای یا انتهای جمله در یک رونویسیِ جزئی هرگز به معنی "
-        "حذف آن محتوا، مخالفت مدل یا شنیده‌نشدن آن در صوت نیست. بخش پایدار Turbo را به دلیل کوتاه‌تر "
-        "بودن متن Medium/Large حذف نکن. راهنماهای زیر فقط با شواهد مثبت استفاده شوند.",
+        "حذف آن محتوا، مخالفت مدل یا شنیده‌نشدن آن در صوت نیست. بخش‌های درج‌شده از مرحلهٔ قبلی "
+        "آبشار (Turbo یا Large) را به دلیل کوتاه‌تر بودن متن جزئی حذف نکن. راهنماهای زیر فقط با "
+        "شواهد مثبت استفاده شوند.",
         "فاعل وضعیت‌هایی مانند «فعال است» را عوض نکن. اسم چیزی که فعال است باید از شواهد "
         "شنیده‌شده پشتیبانی شود و حق جایگزینی آن با موجودیت دیگری را نداری.",
         "8) احوال‌پرسی، تکیه‌کلام و بخش بی‌معنا را حذف کن. بخش نامفهوم را حدس نزن.",
@@ -1147,8 +1162,9 @@ def build_prompt(source_text: str, v9: dict[str, Any],
                 if len(heard) > 240:
                     heard = heard[:237].rstrip() + "…"
                 lines.append(
-                    f"- {name}: اصل مدل فقط {intervals} را شنیده؛ بخش‌های پایدار Turbo به متن "
-                    f"مقایسه‌ای آن اضافه شده‌اند. متن شنیده‌شدهٔ همان بازه: «{heard}»")
+                    f"- {name}: اصل مدل فقط {intervals} را شنیده؛ بخش‌های نشنیده از مرحلهٔ قبلی "
+                    f"آبشار به متن مقایسه‌ای آن اضافه شده‌اند و رأی مستقل نیستند. "
+                    f"متن شنیده‌شدهٔ همان بازه: «{heard}»")
     if approved_drugs:
         lines.append("نام‌های دارویی تأییدشدهٔ واژه‌نامه در همین اجرا: " + "، ".join(approved_drugs))
     if notes:

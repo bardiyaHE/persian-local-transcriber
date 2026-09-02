@@ -10,7 +10,8 @@ $Root = $PSScriptRoot
 $ProfileKey = $Profile.ToLowerInvariant()
 $Directories = @(
     'models/medium', 'models/large-v3-turbo', 'models/large-v3',
-    'models/qwen3.5-35b-a3b-gguf', 'runtime/ffmpeg', 'runtime/deepfilternet',
+    'models/qwen3.5-35b-a3b-gguf', 'runtime/ffmpeg', 'runtime/demucs-cache',
+    'runtime/pyannote-cache',
     'runtime/cuda-libs', 'runtime/llama.cpp/cpu', 'runtime/llama.cpp/cuda',
     'wheelhouse', 'offline-lexicon', 'offline-corpus', 'inputs', 'outputs', 'src'
 )
@@ -239,24 +240,10 @@ if (-not (Test-Path -LiteralPath $Ffmpeg)) {
 & $Ffmpeg -version | Select-Object -First 1
 if ($LASTEXITCODE -ne 0) { throw 'Local FFmpeg validation failed.' }
 
-$DeepFilter = Join-Path $Root 'runtime\deepfilternet\deep-filter.exe'
-if (-not (Test-Path -LiteralPath $DeepFilter)) {
-    if ($Offline) { throw "Offline setup: DeepFilterNet is missing: $DeepFilter" }
-    $DfRelease = Invoke-RestMethod `
-        -Uri 'https://api.github.com/repos/Rikorose/DeepFilterNet/releases/latest' `
-        -Headers @{ 'User-Agent'='whisper-persian-local' }
-    $DfAsset = $DfRelease.assets | Where-Object {
-        $_.name -match 'x86_64-pc-windows-msvc\.exe$'
-    } | Select-Object -First 1
-    if (-not $DfAsset) { throw 'Could not locate the DeepFilterNet Windows x64 binary.' }
-    $DeepFilterCache = Join-Path $DownloadCache ([string]$DfAsset.name)
-    Invoke-ResumableDownload -Url $DfAsset.browser_download_url -Destination $DeepFilterCache
-    Copy-Item -LiteralPath $DeepFilterCache -Destination $DeepFilter -Force
-    $DfRelease | Select-Object tag_name,published_at,html_url | ConvertTo-Json |
-        Set-Content -Encoding utf8 (Join-Path $Root 'runtime\deepfilternet\release.json')
-}
-& $DeepFilter --version
-if ($LASTEXITCODE -ne 0) { throw 'DeepFilterNet validation failed.' }
+$EnhancementArgs = @()
+if ($Offline) { $EnhancementArgs += '-Offline' }
+& (Join-Path $Root 'setup_audio_enhancement.ps1') @EnhancementArgs
+if ($LASTEXITCODE -ne 0) { throw 'Demucs + pyannote enhancement setup failed.' }
 
 $ModelArgs = @('--root', $Root, '--profile', $ProfileKey)
 if ($Offline) { $ModelArgs += '--local-only' }
@@ -291,6 +278,7 @@ $InstallManifest = [ordered]@{
     device = $Device
     compute_type = $ComputeType
     packages = ($PackageVersions | ConvertFrom-Json)
+    audio_enhancement = 'HTDemucs + pyannote Community-1 dominant-speaker selection'
     external_speech_fallback_enabled_by_default = $false
     bundled_user_data = $false
 }
