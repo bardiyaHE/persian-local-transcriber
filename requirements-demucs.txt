@@ -1,5 +1,0 @@
-demucs==4.1.0
-huggingface-hub==1.28.0
-numpy==2.3.3
-psutil==7.0.0
-torch==2.13.0

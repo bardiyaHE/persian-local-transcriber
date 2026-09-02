@@ -4,9 +4,8 @@
 
 1. FFprobe detects the actual audio stream instead of trusting the filename extension.
 2. FFmpeg converts the source to normalized mono PCM.
-3. HTDemucs separates the vocal/speech stem from background music while the raw normalized copy is retained.
-4. pyannote Community-1 diarizes the speech stem. If it finds multiple speakers, the speaker with the greatest exclusive speaking time is retained in a full-length, timestamp-preserving track; a 60 ms boundary pad and short fades reduce clipped word edges. A single-speaker stem is preserved without gating.
-5. Whisper is explicitly forced to Persian (`fa`). A script-quality guard rejects an enhanced branch when non-Persian letters dominate while the raw branch remains valid. The raw hypothesis becomes the safe fallback, and Full mode sends the complete audio to the secondary ASR families for review.
+3. DeepFilterNet creates a noise-reduced copy while the raw normalized copy is retained.
+4. Whisper is explicitly forced to Persian (`fa`). A script-quality guard rejects a denoised branch when non-Persian letters dominate while the raw branch remains valid. The raw hypothesis becomes the safe fallback, and Full mode sends the complete audio to the secondary ASR families for review.
 
 ## Lite profile
 
@@ -35,7 +34,6 @@ Lite is a useful transcript-only application, not a placeholder installer.
 - The public terminology index contains licensed terms only.
 - The n-gram SQLite file is generated locally from public sources and is not committed.
 - Google Speech is an explicit opt-in fallback and is disabled in a fresh installation.
-- Demucs and pyannote weights are downloaded only during setup. Runtime sets Hugging Face offline mode, disables pyannote metrics, and does not upload audio.
 
 ## Installation state
 

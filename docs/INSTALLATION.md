@@ -8,13 +8,7 @@
 - Internet access during the first setup
 - NVIDIA GPU recommended; CPU mode is supported but substantially slower
 
-The enhancement stage uses the gated `pyannote/speaker-diarization-community-1` model. Accept its access terms on Hugging Face and expose a read token before setup:
-
-```powershell
-$env:HF_TOKEN = 'hf_...'
-```
-
-The token is used only to cache the model during setup and is never written to reports. Runtime inference is forced offline and pyannote telemetry is disabled. The Full public n-gram build uses Persian Wikipedia and a public Common Voice text manifest; it does not download Common Voice audio.
+No Hugging Face token is required for the pinned public model repositories used by setup. The Full public n-gram build uses Persian Wikipedia and a public Common Voice text manifest; it does not download Common Voice audio.
 
 ## Validate before downloading
 
@@ -70,6 +64,5 @@ Run the health check again at any time:
 - **Insufficient disk space:** free additional space and rerun setup; completed downloads are reused.
 - **Interrupted download:** rerun the same setup command.
 - **CUDA libraries missing:** rerun setup while the NVIDIA driver and `nvidia-smi` are available.
-- **pyannote access denied:** accept the Community-1 model terms, set `HF_TOKEN`, and rerun setup.
 - **Full requested after Lite:** run `setup.ps1 -Profile Full` before launching Full processing.
 - **Corpus source unavailable:** check access to Persian Wikipedia and Hugging Face, then rerun Full setup.

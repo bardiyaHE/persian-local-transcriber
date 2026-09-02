@@ -63,14 +63,9 @@ def run(root: Path, profile: str) -> dict:
     for name, relative in {
         "ffmpeg": "runtime/ffmpeg/ffmpeg.exe",
         "ffprobe": "runtime/ffmpeg/ffprobe.exe",
-        "demucs_python": "runtime/demucs-venv/Scripts/python.exe",
-        "pyannote_python": "runtime/pyannote-venv/Scripts/python.exe",
+        "deepfilternet": "runtime/deepfilternet/deep-filter.exe",
     }.items():
         result["binaries"][name] = require_file(root / relative)
-    enhancement_manifest = root / "runtime/audio-enhancement-manifest.json"
-    require_file(enhancement_manifest)
-    result["audio_enhancement"] = json.loads(
-        enhancement_manifest.read_text(encoding="utf-8-sig"))
 
     selected_models = (
         ("large-v3-turbo",)

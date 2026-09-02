@@ -64,8 +64,8 @@ def pipeline_status(run_dir: Path) -> str:
         return "در حال آماده‌سازی فایل…"
     if not (run_dir / "normalized_mono_48k.wav").exists():
         return "مرحله ۱ از ۱۴: تبدیل صوت با FFmpeg…"
-    if not (run_dir / "enhanced_pyannote.wav").exists():
-        return "مرحله ۲ از ۱۴: جداسازی موسیقی و گوینده با Demucs + pyannote…"
+    if not (run_dir / "enhanced_deepfilternet.wav").exists():
+        return "مرحله ۲ از ۱۴: حذف نویز با DeepFilterNet…"
     completed = sum((run_dir / "hypotheses" / key / f"{key}.json").exists() for key in hypotheses)
     if completed < len(hypotheses):
         return (f"مراحل ۳ تا ۸ از ۱۴: Turbo و بازبینی انتخابی — "
@@ -757,7 +757,7 @@ def build_demo() -> gr.Blocks:
     if profile == "lite":
         intro = (
             "# رونویسی فارسی محلی — Lite\n"
-            "فایل صوتی با FFmpeg نرمال می‌شود؛ Demucs موسیقی را جدا می‌کند و pyannote گویندهٔ غالب را نگه می‌دارد. "
+            "فایل صوتی با FFmpeg نرمال و با DeepFilterNet نویزگیری می‌شود. "
             "Whisper Large V3 Turbo روی نسخهٔ خام و نویزگیری‌شده اجرا می‌شود و متن Turbo تحویل می‌گردد. "
             "این پروفایل برای دانلود و اجرای سبک‌تر است و Qwen، MiniLM، n-gram و خلاصه‌ساز Full را اجرا نمی‌کند."
         )

@@ -689,60 +689,6 @@ def merge(hypotheses: dict[str, dict[str, Any]]) -> tuple[str, list[dict[str, An
     return "".join(output).strip(), decisions
 
 
-def resolve_runtime_path(root: Path, value: str | Path) -> Path:
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
-
-
-def pyannote_runtime(root: Path) -> dict[str, Path]:
-    values: dict[str, str | Path] = {
-        "demucs_python": "runtime/demucs-venv/Scripts/python.exe",
-        "pyannote_python": "runtime/pyannote-venv/Scripts/python.exe",
-        "demucs_cache": "runtime/demucs-cache",
-        "pyannote_cache": "runtime/pyannote-cache",
-    }
-    config_path = root / "runtime" / "pyannote-enhancer.json"
-    if config_path.is_file():
-        payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
-        for key in values:
-            if payload.get(key):
-                values[key] = payload[key]
-    return {key: resolve_runtime_path(root, value) for key, value in values.items()}
-
-
-def create_pyannote_enhanced_audio(root: Path, run_dir: Path, normalized: Path,
-                                   ffmpeg: Path, device: str, log) -> tuple[Path, dict, float]:
-    runtime = pyannote_runtime(root)
-    enhancer = root / "src" / "pyannote_enhancer.py"
-    diarizer = root / "src" / "pyannote_diarize.py"
-    required = [enhancer, diarizer, runtime["demucs_python"], runtime["pyannote_python"]]
-    for path in required:
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"Required Demucs/pyannote component is missing: {path}. Run setup.ps1.")
-    enhanced = run_dir / "enhanced_pyannote.wav"
-    work_dir = run_dir / "pyannote-enhancement"
-    command = [
-        sys.executable, str(enhancer), "--audio", str(normalized),
-        "--output", str(enhanced), "--work-dir", str(work_dir),
-        "--ffmpeg", str(ffmpeg),
-        "--demucs-python", str(runtime["demucs_python"]),
-        "--pyannote-python", str(runtime["pyannote_python"]),
-        "--pyannote-runner", str(diarizer),
-        "--demucs-cache", str(runtime["demucs_cache"]),
-        "--pyannote-cache", str(runtime["pyannote_cache"]),
-        "--device", device,
-    ]
-    started = time.perf_counter()
-    run(command, log)
-    elapsed = time.perf_counter() - started
-    report_path = work_dir / "enhancement-report.json"
-    if not enhanced.is_file() or not report_path.is_file():
-        raise RuntimeError("Demucs/pyannote enhancement did not produce its required outputs")
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    return enhanced, report, elapsed
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, required=True)
@@ -773,7 +719,8 @@ def main() -> None:
         log.write(f"run_id={run_id}\nsource={audio}\n")
         ffmpeg = root / "runtime" / "ffmpeg" / "ffmpeg.exe"
         ffprobe = root / "runtime" / "ffmpeg" / "ffprobe.exe"
-        for tool in (ffmpeg, ffprobe):
+        deepfilter = root / "runtime" / "deepfilternet" / "deep-filter.exe"
+        for tool in (ffmpeg, ffprobe, deepfilter):
             if not tool.is_file():
                 raise FileNotFoundError(f"Required local tool missing: {tool}. Run setup.ps1.")
         raw_meta = probe(ffprobe, audio, log)
@@ -786,8 +733,18 @@ def main() -> None:
              "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(normalized)], log)
         normalize_seconds = time.perf_counter() - start
         normalized_meta = probe(ffprobe, normalized, log)
-        enhanced, enhancement_report, enhancement_seconds = create_pyannote_enhanced_audio(
-            root, run_dir, normalized, ffmpeg, args.device, log)
+        df_temp = run_dir / "deepfilter-work"
+        df_temp.mkdir()
+        start = time.perf_counter()
+        df_result = run([str(deepfilter), "--compensate-delay", "--output-dir",
+                         str(df_temp), str(normalized)], log)
+        deepfilter_seconds = time.perf_counter() - start
+        produced = [path for path in df_temp.glob("*.wav") if path.is_file()]
+        if len(produced) != 1:
+            raise RuntimeError(
+                f"DeepFilterNet did not produce exactly one WAV: {produced}\n{df_result.stdout}")
+        enhanced = run_dir / "enhanced_deepfilternet.wav"
+        shutil.move(str(produced[0]), enhanced)
         enhanced_meta = probe(ffprobe, enhanced, log)
         hypotheses: dict[str, dict[str, Any]] = {}
         timings = []
@@ -1040,7 +997,10 @@ def main() -> None:
             "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
             "packages": {name: importlib.metadata.version(name) for name in
                          ["faster-whisper", "ctranslate2", "huggingface-hub", "numpy"]},
-            "audio_enhancement": enhancement_report,
+            "deepfilternet": "0.5.6 official x86_64-pc-windows-msvc binary",
+            "deepfilternet_command": subprocess.list2cmdline(
+                [str(deepfilter), "--compensate-delay", "--output-dir",
+                 str(df_temp), str(normalized)]),
         }
         (run_dir / "system-info.json").write_text(json.dumps(system_info, ensure_ascii=False, indent=2), encoding="utf-8")
         rows = []
@@ -1059,8 +1019,8 @@ def main() -> None:
             "# گزارش اجرای محلی", "",
             f"- شناسه اجرا: `{run_id}`", f"- دستگاه: `{args.device}` / `{args.compute_type}` / {args.threads} CPU threads",
             f"- تبدیل FFmpeg: {normalize_seconds:.2f} ثانیه",
-            f"- جداسازی پس‌زمینه و گوینده با Demucs + pyannote: {enhancement_seconds:.2f} ثانیه",
-            "- زنجیرهٔ enhanced: HTDemucs برای حذف موسیقی، سپس pyannote Community-1 و نگه‌داشتن گویندهٔ غالب",
+            f"- نویزگیری DeepFilterNet: {deepfilter_seconds:.2f} ثانیه",
+            "- DeepFilterNet: نسخه 0.5.6، باینری رسمی Windows x64، با `--compensate-delay`",
             "", "## مشخصات صدا", "", "### خام", "", "```json", json.dumps(raw_meta, ensure_ascii=False, indent=2), "```",
             "", "### WAV نرمال‌شده", "", "```json", json.dumps(normalized_meta, ensure_ascii=False, indent=2), "```",
             "", "### نویزگیری‌شده", "", "```json", json.dumps(enhanced_meta, ensure_ascii=False, indent=2), "```",
@@ -1083,7 +1043,6 @@ def main() -> None:
         (run_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
         summary = {"run_id": run_id, "run_dir": str(run_dir), "delivery": str(delivery),
                    "raw_metadata": raw_meta, "enhanced_metadata": enhanced_meta,
-                   "audio_enhancement": enhancement_report,
                    "timings": timings, "device": args.device, "compute_type": args.compute_type,
                    "adaptive_turbo": args.adaptive_turbo, "profile": args.profile,
                    "adaptive_turbo_plan": adaptive_plan,

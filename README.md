@@ -2,7 +2,7 @@
 
 A local-first Persian speech-to-text application with two installation profiles:
 
-- **Lite:** Whisper Large V3 Turbo on raw audio and a locally separated main-speaker track. It produces a transcript without installing the local language model.
+- **Lite:** Whisper Large V3 Turbo on raw and noise-reduced audio. It produces a transcript without installing the local language model.
 - **Full:** adaptive multi-model Whisper, deterministic consensus, public lexicon and local n-gram evidence, constrained Qwen reranking, and a separate local summary.
 
 The repository contains code, documentation, and a licensed public terminology index. It contains no user recording, transcript, generated output, evaluation reference, patient record, runtime database, model weight, credential, cache, or log.
@@ -33,15 +33,13 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Running `setup.ps1` again is safe. Completed files are reused, Hugging Face downloads resume from their local cache, checksums are verified, and only missing profile components are installed. A Lite installation can be upgraded by running `setup.ps1 -Profile Full`.
 
-Both profiles use the gated `pyannote/speaker-diarization-community-1` model. Before the first setup, accept that model's Hugging Face access terms and set `HF_TOKEN`. Setup caches all required enhancement weights; audio processing then runs offline with telemetry disabled.
-
 The local interface opens at `http://127.0.0.1:7860`.
 
 ## What setup installs
 
 | Component | Lite | Full | Stored in Git |
 |---|---:|---:|---:|
-| FFmpeg, HTDemucs, and pyannote Community-1 | yes | yes | no |
+| FFmpeg and DeepFilterNet | yes | yes | no |
 | Whisper Large V3 Turbo | yes | yes | no |
 | Whisper Medium and Large V3 | no | yes | no |
 | MiniLM semantic encoder | no | yes | no |
@@ -49,7 +47,7 @@ The local interface opens at `http://127.0.0.1:7860`.
 | Licensed public terminology index | no | yes | yes |
 | Runtime n-gram SQLite database | no | built locally | no |
 
-The two isolated enhancement environments add several gigabytes because Demucs and pyannote require different pinned Torch stacks. Full also requires roughly 26 GB for ASR/LLM model weights plus installation headroom. Exact usage varies with GPU runtime packages and caches.
+Lite requires roughly 2–3 GB after dependencies. Full requires roughly 26 GB for model weights plus installation headroom. Exact usage varies with GPU runtime packages and caches.
 
 ## Command line
 
